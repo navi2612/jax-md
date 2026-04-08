@@ -39,7 +39,7 @@ from typing import Any, Callable, TypeVar, Union, Tuple, Dict, Optional
 
 import functools
 
-from jax import grad, value_and_grad
+from jax import grad, value_and_grad,vmap,debug
 from jax import jit
 from jax import random
 import jax.numpy as jnp
@@ -1154,6 +1154,75 @@ def nvt_langevin(
 
   return init_fn, step_fn
 
+
+def rotation_2d_3x3(theta):
+  c = jnp.cos(theta)
+  s = jnp.sin(theta)
+  return jnp.array([[c, -s, 0.0],
+                    [s,  c, 0.0],
+                    [0.0, 0.0, 1.0]], dtype=theta.dtype)
+
+
+@dataclasses.dataclass
+class BrownianGeneralized2DState:
+  position: Array
+  rng: Array
+
+def brownian_generalized_2d(
+  force_fn_body,
+  shift_fn,
+  dt,
+  kT,
+  mobility_body=None,
+  resistance_body=None,
+):
+  if (mobility_body is None) == (resistance_body is None):
+    raise ValueError('Specify exactly one of mobility_body or resistance_body.')
+
+  if resistance_body is not None:
+    mobility_body = jnp.linalg.inv(resistance_body)
+
+  chol_mobility_body = jnp.linalg.cholesky(mobility_body)
+  rotation_2d_3x3_batched = vmap(rotation_2d_3x3)
+
+  def init_fn(key, q):
+    return BrownianGeneralized2DState(q, key)
+
+  def step_fn(state, **kwargs):
+    _dt = kwargs.pop('dt', dt)
+    _kT = kwargs.pop('kT', kT)
+
+    q, key = dataclasses.astuple(state)
+    key, split = random.split(key)
+
+    theta = q[:, 2]
+    B = rotation_2d_3x3_batched(theta)
+
+    F_body = force_fn_body(q, **kwargs)  # (n, 3)
+
+    dq_det_body = (F_body @ mobility_body.T) * _dt
+
+    xi = random.normal(split, q.shape, q.dtype)  # (n, 3)
+    dq_stoch_body = (
+        jnp.sqrt(2.0 * _kT * _dt) *
+        (xi @ chol_mobility_body.T)
+    )
+
+    # Thermal drift for constant body-frame mobility with tr-coupling.
+    drift_velocity_body = jnp.array([
+        -mobility_body[1, 2],
+        mobility_body[0, 2],
+        0.0
+    ], dtype=q.dtype)
+    dq_drift_body = _kT * _dt * drift_velocity_body
+
+    dq_body = dq_det_body + dq_stoch_body + dq_drift_body
+    dq_lab = jnp.einsum('nij,nj->ni', B, dq_body)
+
+    q = shift_fn(q, dq_lab, **kwargs)
+    return BrownianGeneralized2DState(q, key) 
+
+  return init_fn, step_fn
 
 @dataclasses.dataclass
 class BrownianState:
