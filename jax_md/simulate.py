@@ -35,7 +35,7 @@ can be used for testing purposes, but is not often used otherwise.
 
 from collections import namedtuple
 
-from typing import Any, Callable, TypeVar, Union, Tuple, Dict, Optional
+from typing import Any, Callable, TypeVar, Union, Tuple, Dict, Optional, TYPE_CHECKING
 
 import functools
 
@@ -52,6 +52,8 @@ from jax_md import space
 from jax_md import dataclasses
 from jax_md import partition
 from jax_md import smap
+if TYPE_CHECKING:
+  from jax_md import rigid_body
 
 static_cast = util.static_cast
 
@@ -1155,6 +1157,80 @@ def nvt_langevin(
   return init_fn, step_fn
 
 
+
+@dataclasses.dataclass
+class BrownianRigid2DState:
+    position: Any
+    rng: jnp.ndarray
+
+def wrap_angle(theta):
+    return (theta + jnp.pi) % (2 * jnp.pi) - jnp.pi
+
+def brownian_generalized_rigid_2d(
+    energy_or_force_fn,
+    shift_fn,
+    dt,
+    kT,
+    mobility_body=None,
+    resistance_body=None,
+):
+    from jax_md import rigid_body
+
+    if (mobility_body is None) == (resistance_body is None):
+        raise ValueError("Specify exactly one of mobility_body or resistance_body.")
+    if resistance_body is not None:
+        mobility_body = jnp.linalg.inv(resistance_body)
+
+    chol = jnp.linalg.cholesky(mobility_body)
+    force_fn = quantity.canonicalize_force(energy_or_force_fn)
+
+    def init_fn(key, body):
+        return BrownianRigid2DState(body, key)
+
+    def step_fn(state, **kwargs):
+        _dt = kwargs.pop("dt", dt)
+        _kT = kwargs.pop("kT", kT)
+
+        body, key = state.position, state.rng
+        key, split = random.split(key)
+
+        theta = body.orientation
+        R = rigid_body.rotation2d(theta) # body -> lab
+        #cant directly use .T as R is batched
+        RT = jnp.swapaxes(R, -1, -2)  # lab -> body
+
+        #take rigidbody position and return rigidbody force
+        force = force_fn(body, **kwargs)  # RigidBody(force_xy, torque)
+
+        #rigidbody can represent many things. so center can be Force and orientation can be Torque
+        # RT (N,2,2) and Force (N,2)
+        F_body_xy = jnp.einsum("nij,nj->ni", RT, force.center)
+        W_body = jnp.concatenate([F_body_xy, force.orientation[:, None]], axis=-1)# (N, 3)
+
+        xi = random.normal(split, W_body.shape, W_body.dtype)
+
+        dq_det_body = jnp.einsum("ni,ki->nk", W_body, mobility_body) * _dt
+        dq_stoch_body = jnp.sqrt(2.0 * _kT * _dt) * jnp.einsum("ni,ji->nj", xi, chol)
+
+        drift_body = _kT * _dt * jnp.array(
+            [-mobility_body[1, 2], mobility_body[0, 2], 0.0],
+            dtype=W_body.dtype,
+        )
+
+        dq_body = dq_det_body + dq_stoch_body + drift_body
+
+        dR_lab = jnp.einsum("nij,nj->ni", R, dq_body[:, :2])
+        dtheta = dq_body[:, 2]
+
+        new_center = shift_fn(body.center, dR_lab, **kwargs)
+        new_theta = wrap_angle(body.orientation + dtheta)
+
+        new_body = rigid_body.RigidBody(new_center, new_theta)
+        return BrownianRigid2DState(new_body, key)
+
+    return init_fn, step_fn
+
+
 def rotation_2d_3x3(theta):
   c = jnp.cos(theta)
   s = jnp.sin(theta)
@@ -1208,7 +1284,7 @@ def brownian_generalized_2d(
         (xi @ chol_mobility_body.T)
     )
 
-    # Thermal drift for constant body-frame mobility with tr-coupling.
+    # Thermal drift for constant body-frame mobility with tr-coupling for 2d.
     drift_velocity_body = jnp.array([
         -mobility_body[1, 2],
         mobility_body[0, 2],
