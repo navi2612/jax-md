@@ -1195,9 +1195,9 @@ def brownian_generalized_rigid_2d(
         key, split = random.split(key)
 
         theta = body.orientation
-        R = rigid_body.rotation2d(theta) # body -> lab
+        R = rigid_body.rotation2d(theta) #body -> lab
         #cant directly use .T as R is batched
-        RT = jnp.swapaxes(R, -1, -2)  # lab -> body
+        RT = jnp.swapaxes(R, -1, -2)  #lab -> body
 
         #take rigidbody position and return rigidbody force
         force = force_fn(body, **kwargs)  # RigidBody(force_xy, torque)
