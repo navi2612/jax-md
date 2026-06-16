@@ -1,0 +1,67 @@
+{
+  "datetime": "2026-06-16T10:51:48",
+  "label": "linear_pol",
+  "n_steps": 200000,
+  "dt": 0.0001,
+  "total_time_s": 20.0,
+  "kT": 4.14e-21,
+  "temperature_K": 299.8589793640527,
+  "seed": 0,
+  "n_particles": 1,
+  "q0": [
+    [
+      0.0,
+      0.0,
+      0.0
+    ]
+  ],
+  "resistance_body": [
+    [
+      4.7e-07,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      4.7e-07,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      8e-18
+    ]
+  ],
+  "shift_fn": "shift_generalized_2d",
+  "force": {
+    "type": "active_optical",
+    "phi_pol": 0.0,
+    "fitted_coefficients": {
+      "FX_pN": [
+        1.135,
+        0.8574,
+        0.0
+      ],
+      "FY_pN": [
+        0.0,
+        0.0,
+        -0.0388
+      ],
+      "TZ_pN_nm": [
+        0.0,
+        0.0,
+        -238.4348
+      ]
+    },
+    "interaction": {
+      "type": "soft_sphere",
+      "sigma": 2e-06,
+      "epsilon": 1e-18,
+      "alpha": 2.0,
+      "k_trap": 0.0
+    }
+  },
+  "jax_version": "0.9.2",
+  "jax_md_version": null,
+  "git_commit": "d64be0b"
+}
