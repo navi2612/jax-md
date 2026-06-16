@@ -1,8 +1,10 @@
 """Reusable 2D overdamped (Brownian) trajectory simulation.
 
-Wraps ``jax_md.simulate.brownian_generalized_2d`` into a small, reusable API so
-you can simulate one (or many) point-like particles under arbitrary optical
-forces/torques, starting from arbitrary positions/orientations.
+Wraps the local ``brownian_generalized_2d`` integrator into a small, reusable
+API so you can simulate one (or many) point-like particles under arbitrary
+optical forces/torques, starting from arbitrary positions/orientations. The
+integrator lives in ``brownian_generalized_2d.py`` and uses jax-md only as a
+normal package, so jax-md can be upgraded without touching this code.
 
 The generalized coordinate of each particle is ``q = [x, y, theta]`` (metres,
 metres, radians). A force function returns, *in the body frame*, the stacked
@@ -38,7 +40,11 @@ import numpy as np
 import jax.numpy as jnp
 from jax import random, lax, grad, vmap
 
-from jax_md import simulate, energy, space
+from jax_md import energy, space
+
+# Local integrator, decoupled from the jax-md package so jax-md can be upgraded
+# freely (see brownian_generalized_2d.py).
+from brownian_generalized_2d import brownian_generalized_2d
 
 K_B = 1.380649e-23                                 # Boltzmann constant [J/K]
 
@@ -189,6 +195,7 @@ def run_brownian_2d(
     resistance_body=DEFAULT_RESISTANCE_BODY,
     seed=0,
     shift_fn=shift_generalized_2d,
+    include_drift=True,
 ):
     """Integrate overdamped 2D Brownian dynamics and return the trajectory.
 
@@ -209,12 +216,13 @@ def run_brownian_2d(
     """
     q0 = _as_q0(q0)
 
-    init_fn, step_fn = simulate.brownian_generalized_2d(
+    init_fn, step_fn = brownian_generalized_2d(
         force_fn_body=force_fn_body,
         shift_fn=shift_fn,
         dt=dt,
         kT=kT,
         resistance_body=resistance_body,
+        include_drift=include_drift,
     )
 
     state = init_fn(random.PRNGKey(seed), q0)
@@ -362,9 +370,10 @@ def simulate_and_save(
 if __name__ == "__main__":
     energy_fn = make_soft_sphere_energy(sigma=2.0e-6, epsilon=1.0e-18, alpha=2.0)
     force_fn = make_active_optical_force(phi_pol=0.0, interaction_energy_fn=energy_fn)
+    force_fn = make_constant_force(1.135e-12, 0.045e-12,440.44e-21)
 
     q0 = [0.0, 0.0, 0.0]  # single particle at the origin
 
     run_dir, traj, state = simulate_and_save(
-        force_fn, q0, n_steps=200_000, dt=1e-4, label="linear_pol")
+        force_fn, q0, n_steps=1_000_000, dt=1e-4, label="circular_pol")
     print("trajectory shape:", traj.shape)
