@@ -38,3 +38,22 @@ def active_force_torque_body(theta, phi_pol=0.0):
     tau = _harmonic(phi, _TZ) * _PN_NM
     F_active_body = jnp.stack([fbx, fby], axis=1)
     return F_active_body, tau
+
+
+def active_force_torque_body_new(theta, phi_pol):
+    alpha = phi_pol - theta          # relative angle; note the minus theta
+    c, s = jnp.cos(alpha), jnp.sin(alpha)
+
+    # --- torque (scalar, no frame rotation) ---
+    tau_z = 598.194 * c*c + -262.874 * s*s + -0.003 * s*c
+    # tau_z is already the physical torque about +z (counterclockwise positive),
+    # as a function of the current relative angle. Plug directly into the
+    # rotational EOM that uses "+tau increases theta".
+
+    # --- active force: lab-frame from coeffs, then rotate to body frame ---
+    Fx_lab = -0.2493 * c*c + 0.116281 * s*s + 0.93375 * s*c
+    Fy_lab = 0.00218 * c*c + -0.00324 * s*s + -0.00340693 * s*c
+    F_lab  = jnp.stack([Fx_lab, Fy_lab], axis=-1)
+    F_body = vmap(lab_to_body_force)(theta, F_lab)
+
+    return F_body, tau_z

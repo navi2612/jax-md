@@ -15,3 +15,6 @@ examples/output/*
 scripts/
 docs/_build/
 /optical_sim/results/
+!/optical_sim/results/20260617-162610_desing4_res30_linear_30uW/
+!/optical_sim/results/20260617-164648_desing2_res30_linear_30uW/
+!/optical_sim/results/20260617-165058_desing3_res30_linear_30uW

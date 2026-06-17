@@ -112,7 +112,24 @@ def make_constant_force(Fx=0.0, Fy=0.0, tau=0.0):
                           "Fx": float(Fx), "Fy": float(Fy), "tau": float(tau)}
     return force_fn_body
 
+def active_force_torque_body_new(theta, phi_pol):
+    _PN = 1e-12      # pN  -> N
+    _PN_NM = 1e-21
+    alpha = phi_pol - theta          # relative angle; note the minus theta
+    c, s = jnp.cos(alpha), jnp.sin(alpha)
 
+    # --- torque (scalar, no frame rotation) ---
+    tau_z = -2608.94 * c*c + -2608.94 * s*s + 0 * s*c
+    # tau_z is already the physical torque about +z (counterclockwise positive),
+    # as a function of the current relative angle. Plug directly into the
+    # rotational EOM that uses "+tau increases theta".
+
+    # --- active force: lab-frame from coeffs, then rotate to body frame ---
+    Fx_lab = 0.0 * c*c + 0.0 * s*s + 0.0 * s*c
+    Fy_lab = 0.0 * c*c + 0.0 * s*s + 0.0 * s*c
+    F_lab  = jnp.stack([Fx_lab, Fy_lab], axis=-1)
+    #F_body = vmap(lab_to_body_force)(theta, F_lab)
+    return F_lab*_PN*3, tau_z*_PN_NM*3
 def make_active_optical_force(phi_pol=0.0, interaction_energy_fn=None):
     """Orientation-dependent optical force/torque from ``active_optical``.
 
@@ -133,7 +150,7 @@ def make_active_optical_force(phi_pol=0.0, interaction_energy_fn=None):
         theta = q[:, 2]
 
         # orientation-dependent optical active force/torque (body frame)
-        F_active_body, tau_active_body = active_force_torque_body(theta, phi_pol)
+        F_active_body, tau_active_body = active_force_torque_body_new(theta, phi_pol)
         F_active_body = F_active_body.astype(q.dtype)
         tau_active_body = tau_active_body.astype(q.dtype)
 
@@ -259,6 +276,140 @@ def quick_plot(traj, particle=0, pos_units="um", out_path=None, show=False):
     return None
 
 
+def render_video(
+    traj,
+    out_path,
+    pos_units="um",
+    fps=30,
+    n_frames=300,
+    particle_um=10.0,
+    track_corner=True,
+    dt=None,
+    dpi=120,
+):
+    """Render an animation of the particle(s) moving along the trajectory.
+
+    Each particle is drawn as a ``particle_um`` square oriented along its
+    orientation ``theta``. Following the experiment videos, two trajectory
+    lines are traced out (when ``track_corner=True``): a **red** line for the
+    particle centre and a **blue** line for one corner of the square. Because
+    the corner rotates with the body, the blue line wobbles/orbits around the
+    red one whenever the particle spins, exposing both translation and
+    rotation. The (long) trajectory is downsampled to ``n_frames`` evenly-spaced
+    frames so the video stays short.
+
+    Args:
+      traj: ``(n_steps, N, 3)`` array of ``[x, y, theta]``.
+      out_path: output file; extension picks the writer (``.mp4`` needs ffmpeg,
+        ``.gif`` uses Pillow).
+      pos_units: ``"um"`` to plot in micrometres, otherwise metres.
+      fps: frames per second of the output video.
+      n_frames: number of frames to render (trajectory is subsampled to this).
+      particle_um: side length of the square particle marker, in micrometres.
+      track_corner: if True, draw the red centre + blue corner trajectory pair;
+        if False, draw a single centre trajectory line per particle.
+      dt: optional time step [s]; if given, a "t = ... s" clock is drawn.
+      dpi: output resolution.
+
+    Returns the saved ``out_path``.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib import animation
+    from matplotlib.patches import Polygon
+
+    traj = np.asarray(traj)                       # (T, N, 3)
+    scale = 1e6 if pos_units == "um" else 1.0
+    xy = traj[..., :2] * scale                    # (T, N, 2) particle centres
+    theta = traj[..., 2]                          # (T, N)
+    T, N = theta.shape
+
+    # square side in plot units (plot is µm when pos_units == "um", else m)
+    side = particle_um if pos_units == "um" else particle_um * 1e-6
+    half_sq = side / 2.0
+    # unit-square corners in the body frame, centred on the particle
+    base = np.array([[-half_sq, -half_sq], [half_sq, -half_sq],
+                     [half_sq, half_sq], [-half_sq, half_sq]])
+    corner_off = np.array([half_sq, half_sq])     # the tracked (blue) corner
+
+    def square_corners(cx, cy, th):
+        c, s = np.cos(th), np.sin(th)
+        rot = np.array([[c, -s], [s, c]])
+        return base @ rot.T + np.array([cx, cy])
+
+    # corner trajectory: centre + body-frame corner offset rotated by theta
+    c_all, s_all = np.cos(theta), np.sin(theta)   # (T, N)
+    corner_xy = np.stack([
+        xy[..., 0] + c_all * corner_off[0] - s_all * corner_off[1],
+        xy[..., 1] + s_all * corner_off[0] + c_all * corner_off[1],
+    ], axis=-1)                                   # (T, N, 2)
+
+    # evenly-spaced frame indices into the full trajectory
+    frames = np.linspace(0, T - 1, min(n_frames, T)).astype(int)
+
+    # fixed bounds (with a margin) so the view doesn't jump around; include the
+    # corner extent so neither the square nor the blue line clips at the edges.
+    pts = np.concatenate([xy.reshape(-1, 2), corner_xy.reshape(-1, 2)], axis=0)
+    lo = pts.min(axis=0)
+    hi = pts.max(axis=0)
+    span = (hi - lo).max()
+    if span == 0:
+        span = 1.0
+    pad = 0.08 * span + half_sq * np.sqrt(2.0)
+    cx, cy = (lo + hi) / 2
+    half = span / 2 + pad
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.set_xlim(cx - half, cx + half)
+    ax.set_ylim(cy - half, cy + half)
+    ax.set_aspect("equal")
+    ax.set_xlabel("x  (µm)" if pos_units == "um" else "x  (m)")
+    ax.set_ylabel("y  (µm)" if pos_units == "um" else "y  (m)")
+
+    center_paths = [ax.plot([], [], lw=1.0, color="red", alpha=0.85,
+                            label="center" if i == 0 else None)[0]
+                    for i in range(N)]
+    corner_paths = ([ax.plot([], [], lw=1.0, color="blue", alpha=0.85,
+                             label="corner" if i == 0 else None)[0]
+                     for i in range(N)] if track_corner else [])
+    squares = []
+    for i in range(N):
+        poly = Polygon(square_corners(xy[0, i, 0], xy[0, i, 1], theta[0, i]),
+                       closed=True, facecolor="0.6", edgecolor="k",
+                       lw=1.0, alpha=0.85, zorder=3)
+        ax.add_patch(poly)
+        squares.append(poly)
+    if track_corner:
+        ax.legend(loc="upper right", fontsize=9)
+    clock = ax.text(0.02, 0.98, "", transform=ax.transAxes,
+                    va="top", ha="left", fontsize=10)
+
+    def update(f):
+        i = frames[f]
+        for n in range(N):
+            center_paths[n].set_data(xy[:i + 1, n, 0], xy[:i + 1, n, 1])
+            if track_corner:
+                corner_paths[n].set_data(corner_xy[:i + 1, n, 0],
+                                         corner_xy[:i + 1, n, 1])
+            squares[n].set_xy(square_corners(xy[i, n, 0], xy[i, n, 1],
+                                             theta[i, n]))
+        if dt is not None:
+            clock.set_text(f"t = {i * dt:.3g} s")
+        return (*center_paths, *corner_paths, *squares, clock)
+
+    anim = animation.FuncAnimation(
+        fig, update, frames=len(frames), interval=1000 / fps, blit=False)
+
+    out_path = str(out_path)
+    if out_path.lower().endswith(".gif"):
+        writer = animation.PillowWriter(fps=fps)
+    else:
+        writer = animation.FFMpegWriter(fps=fps, bitrate=2000)
+    anim.save(out_path, writer=writer, dpi=dpi)
+    plt.close(fig)
+    print(f"saved {out_path}")
+    return out_path
+
+
 # --------------------------------------------------------------------------
 # saving: one self-documenting folder per run
 # --------------------------------------------------------------------------
@@ -297,6 +448,8 @@ def simulate_and_save(
     label=None,
     results_dir=RESULTS_DIR,
     plot=True,
+    video=False,
+    video_kwargs=None,
     extra_metadata=None,
 ):
     """Run a simulation and save it to its own timestamped results folder.
@@ -306,10 +459,13 @@ def simulate_and_save(
       - ``metadata.json``  : every parameter, the force/resistance config, the
         date, jax version and git commit
       - ``trajectory.png`` : a quick-look plot (unless ``plot=False``)
+      - ``trajectory.mp4`` : an animation (only if ``video=True``)
 
     All ``run_brownian_2d`` arguments are accepted and recorded. ``label`` is an
     optional human-readable tag appended to the folder name; ``extra_metadata``
-    is an optional dict merged into the saved metadata.
+    is an optional dict merged into the saved metadata. Set ``video=True`` to
+    also render an animation; ``video_kwargs`` is an optional dict forwarded to
+    ``render_video`` (e.g. ``{"n_frames": 500, "fps": 30}``).
 
     Returns ``(run_dir, traj, state)``.
     """
@@ -359,6 +515,10 @@ def simulate_and_save(
         json.dump(meta, f, indent=2, default=_json_default)
     if plot:
         quick_plot(traj, out_path=str(run_dir / "trajectory.png"))
+    if video:
+        vkw = dict(video_kwargs or {})
+        vkw.setdefault("dt", float(dt))
+        render_video(traj, out_path=str(run_dir / "trajectory.mp4"), **vkw)
 
     print(f"saved run to {run_dir}")
     return run_dir, traj, state
@@ -370,10 +530,11 @@ def simulate_and_save(
 if __name__ == "__main__":
     energy_fn = make_soft_sphere_energy(sigma=2.0e-6, epsilon=1.0e-18, alpha=2.0)
     force_fn = make_active_optical_force(phi_pol=0.0, interaction_energy_fn=energy_fn)
-    force_fn = make_constant_force(1.135e-12, 0.045e-12,440.44e-21)
+    #force_fn = make_constant_force(1.135e-12, 0.045e-12,440.44e-21)
 
-    q0 = [0.0, 0.0, 0.0]  # single particle at the origin
+    q0 = [0.0, 0.0, 0.0]
 
     run_dir, traj, state = simulate_and_save(
-        force_fn, q0, n_steps=1_000_000, dt=1e-4, label="circular_pol")
+        force_fn, q0, n_steps=500000, dt=1e-4, label="desing3_res30_linear_30uW",
+        video=True, video_kwargs={"n_frames": 400, "fps": 30})
     print("trajectory shape:", traj.shape)
