@@ -136,19 +136,24 @@ def intensity_stripes(period, bright=4.0, dark=0.5, axis=0):
 
 
 def _build_interaction(shape, sigma, epsilon, displacement_fn, box,
-                       use_neighbor_list):
+                       use_neighbor_list, dr_threshold=None,
+                       capacity_multiplier=2.0):
     """Soft-sphere steric force between rigid bodies (lab frame).
 
     Returns ``(interaction_force_fn, nbr_fns)`` (``nbr_fns`` is None for the
     all-pairs path). The neighbor-list cutoff is ``sigma`` (soft_sphere is 0
     beyond sigma), so it returns the SAME forces as all-pairs -- only the cost
-    scaling differs.
+    scaling differs. ``dr_threshold`` is the Verlet skin (defaults to 0.2*sigma);
+    use a *larger* skin when particles move fast (e.g. high light intensity) so
+    the neighbor list does not rebuild every step.
     """
+    if dr_threshold is None:
+        dr_threshold = 0.2 * sigma
     if use_neighbor_list:
         neighbor_fn, ss_nl = energy.soft_sphere_neighbor_list(
             displacement_fn, box, sigma=sigma, epsilon=epsilon, alpha=2.0,
-            dr_threshold=0.2 * sigma,      # Verlet skin in metres, not the 0.2 default
-            capacity_multiplier=2.0,
+            dr_threshold=dr_threshold,     # Verlet skin in metres, not the 0.2 default
+            capacity_multiplier=capacity_multiplier,
         )
         nbr_fns, rigid_energy = rigid_body.point_energy_neighbor_list(
             ss_nl, neighbor_fn, shape)
