@@ -112,24 +112,7 @@ def make_constant_force(Fx=0.0, Fy=0.0, tau=0.0):
                           "Fx": float(Fx), "Fy": float(Fy), "tau": float(tau)}
     return force_fn_body
 
-def active_force_torque_body_new(theta, phi_pol):
-    _PN = 1e-12      # pN  -> N
-    _PN_NM = 1e-21
-    alpha = phi_pol - theta          # relative angle; note the minus theta
-    c, s = jnp.cos(alpha), jnp.sin(alpha)
 
-    # --- torque (scalar, no frame rotation) ---
-    tau_z = -2608.94 * c*c + -2608.94 * s*s + 0 * s*c
-    # tau_z is already the physical torque about +z (counterclockwise positive),
-    # as a function of the current relative angle. Plug directly into the
-    # rotational EOM that uses "+tau increases theta".
-
-    # --- active force: lab-frame from coeffs, then rotate to body frame ---
-    Fx_lab = 0.0 * c*c + 0.0 * s*s + 0.0 * s*c
-    Fy_lab = 0.0 * c*c + 0.0 * s*s + 0.0 * s*c
-    F_lab  = jnp.stack([Fx_lab, Fy_lab], axis=-1)
-    #F_body = vmap(lab_to_body_force)(theta, F_lab)
-    return F_lab*_PN*3, tau_z*_PN_NM*3
 def make_active_optical_force(phi_pol=0.0, interaction_energy_fn=None):
     """Orientation-dependent optical force/torque from ``active_optical``.
 
@@ -150,7 +133,7 @@ def make_active_optical_force(phi_pol=0.0, interaction_energy_fn=None):
         theta = q[:, 2]
 
         # orientation-dependent optical active force/torque (body frame)
-        F_active_body, tau_active_body = active_force_torque_body_new(theta, phi_pol)
+        F_active_body, tau_active_body = active_force_torque_body(theta, phi_pol)
         F_active_body = F_active_body.astype(q.dtype)
         tau_active_body = tau_active_body.astype(q.dtype)
 

@@ -1,28 +1,4 @@
 """Many interacting rigid-body metavehicles in 2D (overdamped Brownian).
-
-Extracted and cleaned from ``notebooks/experiments/metavehicle_swarm.py``. Each
-particle is a rigid union of beads (a filled square by default) that sterically
-repels its neighbours and is driven by a body-frame optical force/torque. A
-neighbor list keeps the interaction ~O(N), so it scales to many particles.
-
-It is consistent with the single-particle code in this folder: same overdamped
-integrator family (the local ``brownian_generalized_rigid_2d``), same kT and
-default resistance matrix.
-
-Coordinates: each particle is a ``jax_md.rigid_body.RigidBody`` with a centre
-``(N, 2)`` [m] and an orientation ``(N,)`` [rad]. The drive is a constant
-body-frame force ``F_body=(Fx, Fy)`` [N] and torque ``tau`` [N.m] (a constant
-torque models circular polarization -> spinners); pass your own ``drive_fn`` for
-an orientation-dependent drive.
-
-Typical use
------------
-    from simulate_swarm import run_swarm
-    out = run_swarm(n_particles=30, n_steps=100_000, label="circular")
-    # out["centers"]: (frames, N, 2) [m]   out["angles"]: (frames, N) [rad]
-
-Run directly (``python simulate_swarm.py``) to validate the forces and do a
-small demo run saved under results/.
 """
 
 import json
@@ -81,14 +57,10 @@ def make_drive(F_body=DEFAULT_F_BODY, tau=DEFAULT_TAU):
 def make_modulated_drive(intensity_fn, F_body=DEFAULT_F_BODY, tau=DEFAULT_TAU):
     """Spatially-modulated optical drive: force AND torque scale with I(x,y)/I0.
 
-    ``intensity_fn(centers)`` maps centres ``(N, 2)`` [m] to a non-negative
+    ``intensity_fn(centers)`` maps centers ``(N, 2)`` [m] to a non-negative
     scaling ``(N,)`` (the local intensity relative to a reference). Models an SLM
     pattern under the linear optical response. Returns the usual
     ``drive_fn(body) -> (f_lab (N,2), tau (N,))``.
-
-    Note: because both F and tau scale with I, the orbit *radius* is unchanged;
-    intensity sets the orbital *speed*. Spatial gradients drive a chiral-taxis
-    drift, not simple accumulation.
     """
     F_body = jnp.asarray(F_body, dtype=jnp.float64)
     tau = jnp.float64(tau)
@@ -152,7 +124,7 @@ def _build_interaction(shape, sigma, epsilon, displacement_fn, box,
     if use_neighbor_list:
         neighbor_fn, ss_nl = energy.soft_sphere_neighbor_list(
             displacement_fn, box, sigma=sigma, epsilon=epsilon, alpha=2.0,
-            dr_threshold=dr_threshold,     # Verlet skin in metres, not the 0.2 default
+            dr_threshold=dr_threshold,     # Verlet skin in meters, not the 0.2 default
             capacity_multiplier=capacity_multiplier,
         )
         nbr_fns, rigid_energy = rigid_body.point_energy_neighbor_list(
@@ -176,7 +148,7 @@ def _total_force(interaction_force_fn, drive_fn):
 
 
 def grid_initial_condition(n_particles, box, seed=2):
-    """Non-overlapping grid of centres with random orientations.
+    """Non-overlapping grid of centers with random orientations.
 
     Returns ``(body0, key)``; ``key`` seeds the Brownian noise.
     """
@@ -194,36 +166,6 @@ def grid_initial_condition(n_particles, box, seed=2):
     return rigid_body.RigidBody(centers, theta), key
 
 
-def droplet_initial_condition(n_particles, side, packing=0.6, box=None,
-                              margin_factor=0.5, seed=2):
-    """A dense disk ("droplet") of particles centred in an otherwise empty box.
-
-    The droplet's own surface is the interface that lets co-rotating spinners
-    drive a rim current -> collective rotation. ``packing`` is the area fraction
-    inside the disk; the box is sized with empty margin around it (unless ``box``
-    is given). Returns ``(body0, key, box)``.
-    """
-    spacing = side / np.sqrt(packing)               # square lattice at `packing`
-    m = int(np.ceil(np.sqrt(n_particles))) + 4
-    xs = (np.arange(m) - (m - 1) / 2) * spacing
-    gx, gy = np.meshgrid(xs, xs)
-    pts = np.stack([gx.ravel(), gy.ravel()], axis=1)
-    pts = pts[np.argsort(np.sum(pts ** 2, axis=1))[:n_particles]]   # N nearest -> disk
-    r_drop = float(np.sqrt(np.max(np.sum(pts ** 2, axis=1))))
-    if box is None:
-        box = 2.0 * r_drop * (1.0 + margin_factor)  # empty margin around droplet
-    centers = jnp.asarray(pts + box / 2.0, dtype=jnp.float64)
-
-    key = random.PRNGKey(seed)
-    key, okey = random.split(key)
-    theta = random.uniform(okey, (n_particles,), minval=-jnp.pi, maxval=jnp.pi,
-                           dtype=jnp.float64)
-    return rigid_body.RigidBody(centers, theta), key, float(box)
-
-
-# --------------------------------------------------------------------------
-# main driver
-# --------------------------------------------------------------------------
 def run_swarm(
     n_particles=20,
     side=10e-6,
@@ -234,7 +176,6 @@ def run_swarm(
     area_fraction=0.165,
     box=None,
     init="grid",
-    droplet_packing=0.6,
     n_steps=100_000,
     dt=1e-4,
     record_every=100,
@@ -270,13 +211,9 @@ def run_swarm(
     n_beads = int(np.asarray(shape.points).shape[0])
 
     # initial condition + periodic box
-    if init == "droplet":
-        body0, key, box = droplet_initial_condition(
-            n_particles, side, packing=droplet_packing, box=box, seed=seed)
-    else:
-        if box is None:                             # density-matched (fixed phi)
-            box = side * float(np.sqrt(n_particles / area_fraction))
-        body0, key = grid_initial_condition(n_particles, box, seed)
+    if box is None:                             # density-matched (fixed phi)
+        box = side * float(np.sqrt(n_particles / area_fraction))
+    body0, key = grid_initial_condition(n_particles, box, seed)
     displacement_fn, shift_fn = space.periodic(box)
 
     custom_drive = drive_fn is not None
@@ -352,7 +289,7 @@ def run_swarm(
         "drive": {"type": "custom" if custom_drive else "constant_body",
                   "F_body_N": [float(f) for f in F_body], "tau_Nm": float(tau)},
         "box_m": float(box), "area_fraction": float(area_fraction),
-        "init": init, "droplet_packing": float(droplet_packing),
+        "init": init,
         "n_steps": int(n_steps), "dt": float(dt), "record_every": int(record_every),
         "n_frames": int(centers.shape[0]),
         "kT": float(kT), "temperature_K": float(kT) / K_B,
@@ -377,7 +314,7 @@ def run_swarm(
 
 
 def _min_gap(centers, box):
-    """Minimum centre-centre distance (minimum-image) -- overlap diagnostic."""
+    """Minimum center-center distance (minimum-image) -- overlap diagnostic."""
     d = centers[:, None, :] - centers[None, :, :]
     d -= box * np.round(d / box)
     dist = np.linalg.norm(d, axis=-1)
@@ -400,7 +337,7 @@ def check_forces(n_particles=9, side=10e-6, n_grid=10, epsilon=5e-17,
     shape, sigma = square_shape(side, n_grid)
     m = int(np.ceil(np.sqrt(n_particles)))
     spacing = spacing_factor * side
-    box = m * spacing + 4 * side                    # roomy: no image interaction
+    box = m * spacing + 4 * side
     coords = (np.arange(m) + 0.5) * spacing + 2 * side
     gx, gy = np.meshgrid(coords, coords)
     centers = jnp.asarray(np.stack([gx.ravel(), gy.ravel()], 1)[:n_particles],
@@ -432,10 +369,6 @@ def check_forces(n_particles=9, side=10e-6, n_grid=10, epsilon=5e-17,
             "buffer_overflow": bool(nbrs.did_buffer_overflow)}
 
 
-# --------------------------------------------------------------------------
-# saving + a minimal snapshot (the heavy poster/animation render stays in the
-# notebooks; this is just a quick look)
-# --------------------------------------------------------------------------
 def _save_run(out, label, results_dir, plot):
     from pathlib import Path
     from datetime import datetime
@@ -451,7 +384,6 @@ def _save_run(out, label, results_dir, plot):
     run_dir.mkdir(parents=True)
 
     out["meta"]["datetime"] = now.isoformat(timespec="seconds")
-    # `side` and `sigma` go in the npz too, so it can be rendered on its own.
     np.savez_compressed(run_dir / "trajectory.npz", centers=out["centers"],
                         angles=out["angles"], box=out["box"],
                         side=out["side"], sigma=out["sigma"])
@@ -464,7 +396,7 @@ def _save_run(out, label, results_dir, plot):
 
 
 def quick_plot_swarm(out, out_path=None, trail_frames=300, show=False):
-    """Minimal snapshot: final oriented squares + recent centre trails."""
+    """Minimal snapshot: final oriented squares + recent center trails."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -502,9 +434,6 @@ def quick_plot_swarm(out, out_path=None, trail_frames=300, show=False):
     return None
 
 
-# --------------------------------------------------------------------------
-# video: render an mp4/gif from a run (the out dict, a run folder, or a .npz)
-# --------------------------------------------------------------------------
 def load_run(run_dir):
     """Load a saved run (trajectory.npz [+ metadata.json]) into a run dict."""
     from pathlib import Path
