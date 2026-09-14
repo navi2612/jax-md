@@ -1,33 +1,3 @@
-"""Reusable 2D overdamped (Brownian) trajectory simulation.
-
-Wraps the local ``brownian_generalized_2d`` integrator into a small, reusable
-API so you can simulate one (or many) point-like particles under arbitrary
-optical forces/torques, starting from arbitrary positions/orientations. The
-integrator lives in ``brownian_generalized_2d.py`` and uses jax-md only as a
-normal package, so jax-md can be upgraded without touching this code.
-
-The generalized coordinate of each particle is ``q = [x, y, theta]`` (metres,
-metres, radians). A force function returns, *in the body frame*, the stacked
-``[Fx, Fy, tau_z]`` of shape ``(N, 3)``.
-
-Typical use
------------
-    from simulate_trajectory import simulate_and_save, make_active_optical_force
-
-    force_fn = make_active_optical_force(phi_pol=0.0)
-    run_dir, traj, state = simulate_and_save(
-        force_fn, q0=[0.0, 0.0, 0.0], n_steps=200_000, label="linear_pol")
-
-Each ``simulate_and_save`` call writes a self-documenting run folder under
-``optical_sim/results/<timestamp>_<label>/`` containing ``trajectory.npz``,
-``metadata.json`` (every parameter, the force/resistance config, date, versions)
-and ``trajectory.png``. Use ``run_brownian_2d`` directly if you only want the
-array back without saving.
-
-Run this file directly (``python simulate_trajectory.py``) to reproduce the
-single-particle example from the brownian_2d notebook and save a run folder.
-"""
-
 import json
 import subprocess
 from datetime import datetime
@@ -49,9 +19,6 @@ from brownian_generalized_2d import brownian_generalized_2d
 K_B = 1.380649e-23                                 # Boltzmann constant [J/K]
 
 
-# --------------------------------------------------------------------------
-# physical defaults (single 470 nm-ish bead, water at 300 K)
-# --------------------------------------------------------------------------
 KT_300K = jnp.float64(1.38e-23 * 300.0)            # k_B T  [J]
 
 # Body-frame resistance (drag) matrix: diag(gamma_x, gamma_y, gamma_rot).
@@ -513,11 +480,12 @@ def simulate_and_save(
 if __name__ == "__main__":
     energy_fn = make_soft_sphere_energy(sigma=2.0e-6, epsilon=1.0e-18, alpha=2.0)
     force_fn = make_active_optical_force(phi_pol=0.0, interaction_energy_fn=energy_fn)
-    #force_fn = make_constant_force(1.135e-12, 0.045e-12,440.44e-21)
+    force_fn = make_constant_force(0.8394827599084255e-12*3, 0.04396073481598326e-12*3,-1259.8000362536472e-21*3)
 
     q0 = [0.0, 0.0, 0.0]
 
+    # the 30uw comes from active_optical where i multiply by 3x to go from 10uw to 30uw for the force and torque
     run_dir, traj, state = simulate_and_save(
-        force_fn, q0, n_steps=500000, dt=1e-4, label="desing3_res30_linear_30uW",
+        force_fn, q0, n_steps=300000, dt=1e-4, label="desing1_res60_circular_30uW",
         video=True, video_kwargs={"n_frames": 400, "fps": 30})
     print("trajectory shape:", traj.shape)

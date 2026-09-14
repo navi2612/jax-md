@@ -7,6 +7,13 @@ measured value vs the expected one with a relative error and PASS/FAIL:
   2. Rotational diffusion      : <cos d_theta> = e^{-D_r t}, D_r = kT * mu_r
   3. Harmonic-trap equilibrium : Var(x) = kT / k        (fluctuation-dissipation)
   4. Deterministic drift (kT=0): x(t) = mu_t F t,  theta(t) = mu_r tau t
+  5. Swarm interaction forces  : neighbor-list == all-pairs, and Newton's 3rd law
+
+Checks 1-4 cover the single point-particle integrator. Check 5 covers the
+*interacting rigid-body* path used by swarm: it verifies that the Verlet
+neighbor list reproduces the all-pairs forces exactly (the cutoff is sigma, so
+they must agree bit for bit, not approximately) and that the internal steric
+forces sum to zero as Newton's third law requires.
 
 Checks 1 & 3 together are the strong one: 1 measures the diffusion produced by
 the *noise*, 3 measures the equilibrium set by the balance of *noise and drag*.
@@ -25,12 +32,15 @@ Run directly:  python validate.py
 
 import numpy as np
 import jax.numpy as jnp
-from jax import vmap
+from jax import vmap, random
+from jax_md import space, rigid_body
 
-from simulate_trajectory import (
+from trajectory import (
     run_brownian_2d, make_constant_force, lab_to_body_force,
     DEFAULT_RESISTANCE_BODY, KT_300K, K_B,
 )
+from swarm import (grid_shape, make_drive, make_force_fn,
+                          soft_sphere_interaction, soft_sphere_all_pairs)
 
 N_WALKERS = 2000
 PASS_TOL = 0.05 # 5% relative error -> PASS
@@ -133,6 +143,54 @@ def check_deterministic_drift(resistance_body=DEFAULT_RESISTANCE_BODY,
                 w_meas=w_meas, w_theory=w_theory)
 
 
+def check_swarm_forces(n_particles=9, n_grid=10, sigma=1e-6, epsilon=5e-17,
+                       seed=2, spacing_factor=0.6):
+    """Validate the rigid-body interaction: NL == all-pairs, and Newton's 3rd law.
+
+    Ported from ``simulate_swarm.check_forces`` onto the ``swarm`` API.
+    The bodies are packed at ``spacing_factor * side < side`` so they actually
+    overlap -- otherwise every interaction force is trivially zero and the check
+    is vacuous. Returns the raw discrepancies (in newtons) plus the scale of the
+    interaction force they should be compared against.
+    """
+    side = n_grid * sigma
+    shape = grid_shape(n_grid)
+    shape = shape.set(points=shape.points * sigma)      # points are in units of sigma
+
+    m = int(np.ceil(np.sqrt(n_particles)))
+    spacing = spacing_factor * side
+    box = m * spacing + 4 * side
+    coords = (np.arange(m) + 0.5) * spacing + 2 * side
+    gx, gy = np.meshgrid(coords, coords)
+    centers = jnp.asarray(np.stack([gx.ravel(), gy.ravel()], 1)[:n_particles],
+                          dtype=jnp.float64)
+    theta = random.uniform(random.PRNGKey(seed), (n_particles,),
+                           minval=-jnp.pi, maxval=jnp.pi, dtype=jnp.float64)
+    body0 = rigid_body.RigidBody(centers, theta)
+    displacement_fn, _ = space.periodic(box)
+    drive_fn = make_drive()
+
+    f_pair_int, _ = soft_sphere_all_pairs(epsilon=epsilon)(
+        shape, sigma, box, displacement_fn)
+    f_nl_int, nbr_fns = soft_sphere_interaction(epsilon=epsilon)(
+        shape, sigma, box, displacement_fn)
+    nbrs = nbr_fns.allocate(body0).update(body0)
+
+    fp = make_force_fn(f_pair_int, drive_fn)(body0, light=1.0)
+    fn = make_force_fn(f_nl_int, drive_fn)(body0, light=1.0, neighbor=nbrs)
+    dF = float(jnp.max(jnp.abs(fp.center - fn.center)))
+    dT = float(jnp.max(jnp.abs(fp.orientation - fn.orientation)))
+
+    # interaction forces are internal -> they must sum (vectorially) to ~0
+    fint = f_pair_int(body0)
+    net = float(jnp.max(jnp.abs(jnp.sum(fint.center, axis=0))))
+    scale = float(jnp.max(jnp.abs(fint.center)))
+
+    return {"nl_vs_pair_force": dF, "nl_vs_pair_torque": dT,
+            "net_interaction_force": net, "interaction_force_scale": scale,
+            "buffer_overflow": bool(nbrs.did_buffer_overflow)}
+
+
 def _rel_err(meas, exp):
     return abs(meas - exp) / abs(exp)
 
@@ -165,6 +223,22 @@ def main(save_dir=None):
     all_pass &= e_w < PASS_TOL
     print(f"{'deterministic spin rate [rad/s]':<36}{drift['w_meas']:>14.4e}"
           f"{drift['w_theory']:>14.4e}{e_w:>9.2%}  {'PASS' if e_w < PASS_TOL else 'FAIL'}")
+
+    # ---- 5. swarm interaction forces (rigid bodies) ----
+    sw = check_swarm_forces()
+    scale = sw["interaction_force_scale"]
+    EXACT_TOL = 1e-9                     # these are exact identities, not estimates
+    for name, val in (("neighbor-list vs all-pairs force", sw["nl_vs_pair_force"]),
+                      ("net internal force (Newton 3)", sw["net_interaction_force"])):
+        rel = val / scale if scale > 0 else float("inf")
+        ok = rel < EXACT_TOL
+        all_pass &= ok
+        print(f"{name:<36}{val:>14.4e}{0.0:>14.4e}{rel:>9.2e}  "
+              f"{'PASS' if ok else 'FAIL'}")
+    if sw["buffer_overflow"]:
+        all_pass = False
+        print("  WARNING: neighbor buffer overflowed during the force check")
+
     print("-" * 88)
     print("ALL CHECKS PASSED\n" if all_pass else "SOME CHECKS FAILED\n")
 

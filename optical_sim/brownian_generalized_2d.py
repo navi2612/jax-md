@@ -19,7 +19,7 @@ from typing import Any
 import jax.numpy as jnp
 from jax import Array, random, vmap
 
-from jax_md import dataclasses, quantity
+from jax_md import dataclasses
 
 
 # --------------------------------------------------------------------------
@@ -51,7 +51,12 @@ def brownian_generalized_rigid_2d(
         mobility_body = jnp.linalg.inv(resistance_body)
 
     chol = jnp.linalg.cholesky(mobility_body)
-    force_fn = quantity.canonicalize_force(energy_or_force_fn)
+    # The rigid integrator is always handed a force (RigidBody(force, torque)),
+    # so we use it directly -- matching the point-particle variant below. Going
+    # through quantity.canonicalize_force would re-run jax.eval_shape with the
+    # NeighborList kwarg, which crashes on the second call in a process (array-
+    # valued pytree metadata), breaking any repeated/replica run.
+    force_fn = energy_or_force_fn
 
     def init_fn(key, body):
         return BrownianRigid2DState(body, key)

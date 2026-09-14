@@ -29,7 +29,7 @@ import jax.numpy as jnp
 from jax import vmap
 
 from brownian_generalized_2d import rotation_2d_3x3
-from simulate_trajectory import (
+from trajectory import (
     run_brownian_2d, make_constant_force, lab_to_body_force, KT_300K,
 )
 

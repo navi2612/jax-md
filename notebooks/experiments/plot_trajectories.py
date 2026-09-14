@@ -28,6 +28,7 @@ import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 from matplotlib.patches import Polygon, Arc, FancyArrowPatch, ConnectionPatch
 import matplotlib.image as mpimg
+import matplotlib
 
 
 # --------------------------------------------------------------------------
@@ -387,12 +388,15 @@ def plot_with_force_curve(
     line_width=3.5,            # bolder lines add visual weight on a poster
     marker_color="0.45",       # darker grey -> markers carry weight
     tau_color="#1b4965",
-    force_color="#e8913a",
+    force_color="#b45309",     # deep amber: 4.6:1 on the panel vs 2.2:1 for #e8913a
     panel_bg="#f7f4ef",        # light tint so panels aren't stark white
     note_linear=None,
     note_circular=None,
     speed_um_s=None,           # if given, shows "v ~ X um/s" in the linear panel
     font_scale=1.5,            # >1 enlarges all ticks/labels for posters
+    label_scale=1.0,           # extra multiplier on axis labels only (tau_z/tau_max, F_x/F_max, x/y)
+    epol_scale=1.0,            # extra multiplier on the E_pol glyph text only
+    font_family="Arial",       # match the poster's body font
     max_points=4000,
     fig_size=(15.5, 7.0),
     out_path="metavehicle_force_curve.svg",
@@ -416,11 +420,28 @@ def plot_with_force_curve(
     plt.rcParams.update({
         "font.size": 15 * fs,
         "axes.titlesize": 21 * fs,
-        "axes.labelsize": 19 * fs,
+        "axes.labelsize": 19 * fs * label_scale,
         "xtick.labelsize": 15 * fs,
         "ytick.labelsize": 15 * fs,
         "legend.fontsize": 14 * fs,
     })
+    _FONT_KEYS = ("font.family", "font.sans-serif", "mathtext.fontset",
+                  "mathtext.rm", "mathtext.it", "mathtext.bf", "svg.fonttype")
+    if font_family:
+        plt.rcParams.update({
+            "font.family": "sans-serif",
+            "font.sans-serif": [font_family, "Helvetica", "DejaVu Sans"],
+            "mathtext.fontset": "custom",      # keep $\\tau$, $F_x$ in the same face
+            "mathtext.rm": font_family,
+            "mathtext.it": font_family + ":italic",
+            "mathtext.bf": font_family + ":bold",
+            "svg.fonttype": "none",            # keep text as text in the SVG
+        })
+    else:
+        # font_family=None -> back to stock matplotlib (DejaVu Sans), even if a
+        # previous call in this session already set Arial (rcParams are global).
+        for _k in _FONT_KEYS:
+            plt.rcParams[_k] = matplotlib.rcParamsDefault[_k]
 
     xy_lin, th_lin = _decimate(*_to_um(traj_linear, pos_units), max_points)
     xy_cir, th_cir = _decimate(*_to_um(traj_circular, pos_units), max_points)
@@ -492,7 +513,7 @@ def plot_with_force_curve(
                                       lw=2.2, mutation_scale=14))
     ax_curve.text(0.42, 0.86, r"$E_{pol}$", transform=ax_curve.transAxes,
                   color="crimson", ha="center", va="bottom",
-                  fontsize=15 * fs, zorder=8)
+                  fontsize=15 * fs * epol_scale, zorder=8)
 
     # ---- bottom-left: linear trajectory (short strip, same scale as orbit) ----
     xr = (col_w * fig_w) / s                   # x-range at shared scale
@@ -526,7 +547,7 @@ def plot_with_force_curve(
                                      arrowstyle="<|-|>", mutation_scale=14,
                                      color="crimson", lw=2.2, zorder=8))
     ax_lin.text(gx, gy +0.1 * yr, r"$E_{pol}$", color="crimson",
-                ha="center", va="bottom", fontsize=15 * fs, zorder=8)
+                ha="center", va="bottom", fontsize=15 * fs * epol_scale, zorder=8)
     # velocity annotation (mirrors the R_T arrow in the circular panel)
     if speed_um_s is not None:
         vy = cen_lin[1] - 0.30 * yr
@@ -551,7 +572,7 @@ def plot_with_force_curve(
     ax_cir.set_xlim(cen_cir[0] - W / 2, cen_cir[0] + W / 2)
     ax_cir.set_ylim(cen_cir[1] - W / 2, cen_cir[1] + W / 2)
     ax_cir.set_xlabel("x  (µm)"); ax_cir.set_ylabel("y  (µm)")
-    _circular_glyph(ax_cir, W, cen_cir, handedness, fontsize=15 * fs)
+    _circular_glyph(ax_cir, W, cen_cir, handedness, fontsize=15 * fs * epol_scale)
     _radius_annotation(ax_cir, cen_cir, r_T, fontsize=15 * fs)
 
     fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
