@@ -1,13 +1,19 @@
+import time
+
 import numpy as np
 import jax
 jax.config.update("jax_enable_x64", True)
 
 import jax.numpy as jnp
 from jax import random, lax, jit
-from jax_md import space, energy, rigid_body, quantity
+from jax_md import space, energy, partition, rigid_body, quantity
+
+from render_swarm import make_video
+from runs import save_run
 
 from brownian_generalized_2d import brownian_generalized_rigid_2d
 from trajectory import KT_300K, K_B, DEFAULT_RESISTANCE_BODY
+from active_optical import active_force_torque_body
 
 # Body-frame optical drive per unit intensity (circular polarization).
 DEFAULT_F_BODY = (1.135e-12, 0.045e-12)        # (Fx, Fy)  [N]
@@ -40,8 +46,93 @@ def grid_shape(n_grid=10):
     return rigid_body.point_union_shape(pts, jnp.ones(pts.shape[0]))
 
 
+def perimeter_shape(side, spacing=0.25):
+    """A hollow square rigid body: overlapping beads on the perimeter only.
+
+    Same footprint as ``grid_shape(side)`` (``side`` is in units of sigma, bead
+    surfaces reach the square edge), but the interior is left empty -- only the
+    outer beads ever touch another body -- and neighbouring beads are
+    ``spacing`` (< 1, in units of sigma) apart, so they overlap and the edge is
+    smooth. Touching beads (``grid_shape``) mesh like gear teeth: sliding two
+    faces past each other takes ~0.5 of the normal force, against ~0.2 at
+    ``spacing=0.5`` and ~0.1 at ``spacing=0.25``.
+
+    More beads touch per length of edge, so a contact is stiffer; pass
+    ``epsilon * spacing`` to keep it about as stiff as with ``grid_shape``. Start
+    from ``grid_initial_condition``: a body that begins inside another stays there.
+    """
+    if side <= 1:
+        raise ValueError(f"side must be > 1 (in units of sigma), got {side}")
+    h = (side - 1.0) / 2.0                     # bead-centre half-width
+    n = int(np.ceil(2 * h / spacing)) + 1
+    t = np.linspace(-h, h, n)
+    full, rest = np.full(n, h), np.full(n - 2, h)
+    pts = np.concatenate([np.stack([t, -full], 1), np.stack([t, full], 1),
+                          np.stack([-rest, t[1:-1]], 1), np.stack([rest, t[1:-1]], 1)])
+    pts = jnp.asarray(pts, dtype=jnp.float64)
+    return rigid_body.point_union_shape(pts, jnp.ones(pts.shape[0]))
+
+def make_disk_lane_init(diameter, tilt_deg=0.0, margin=0.05, max_tries=200_000):
+    """Random non-overlapping disks (periodic box), half pointing +x, half -x."""
+    dmin = diameter * (1 + margin)
+
+    def init(n_particles, box, seed):
+        rng = np.random.default_rng(seed)
+        signs = rng.permutation(np.r_[np.ones(n_particles // 2),
+                                      -np.ones(n_particles - n_particles // 2)])
+        centers, thetas, tries = [], [], 0
+        for s in signs:
+            while True:
+                tries += 1
+                if tries > max_tries:
+                    raise RuntimeError("Could not place all disks; lower the density.")
+                c = rng.uniform(0, box, 2)
+                if centers:
+                    d = np.array(centers) - c
+                    d -= box * np.round(d / box)          # minimum image
+                    if np.min(np.hypot(d[:, 0], d[:, 1])) < dmin:
+                        continue
+                centers.append(c)
+                thetas.append((0.0 if s > 0 else np.pi)
+                              + np.deg2rad(rng.uniform(-tilt_deg, tilt_deg)))
+                break
+        body = rigid_body.RigidBody(jnp.asarray(np.array(centers)),
+                                    jnp.asarray(np.array(thetas)))
+        return body, random.PRNGKey(seed)
+
+    return init
+
+def make_disk_mips_init(diameter):
+    """Square lattice, random vacancies, small jitter, random headings."""
+    def init(n, box, seed):
+        rng = np.random.default_rng(seed)
+        m = int(np.ceil(np.sqrt(n)))
+        a = box / m                                   # lattice spacing
+        if a < 1.05 * diameter:
+            raise ValueError("Too dense for a square-lattice start.")
+        ij = np.stack(np.meshgrid(np.arange(m), np.arange(m)), -1).reshape(-1, 2)
+        ij = ij[rng.choice(m * m, n, replace=False)]
+        jit = 0.5 * (a - 1.05 * diameter)
+        pos = (ij + 0.5) * a + rng.uniform(-jit, jit, (n, 2)) / np.sqrt(2)
+        theta = rng.uniform(-np.pi, np.pi, n)
+        return rigid_body.RigidBody(jnp.asarray(pos), jnp.asarray(theta)), random.PRNGKey(seed)
+    return init
+
+def make_ring_init(r0, beta, center=None):
+    """N disks on a ring of radius r0, heading = ring angle + beta."""
+    def init(n, box, seed):
+        c = np.full(2, box / 2) if center is None else np.asarray(center)
+        psi = 2 * np.pi * np.arange(n) / n
+        pos = c + r0 * np.c_[np.cos(psi), np.sin(psi)]
+        if 2 * r0 * np.sin(np.pi / n) < sigma:
+            raise ValueError("Disks overlap on the initial ring; increase r0 or reduce n.")
+        body = rigid_body.RigidBody(jnp.asarray(pos), jnp.asarray(psi + beta))
+        return body, random.PRNGKey(seed)
+    return init
+
+
 def random_initial_condition(n_particles, box, seed):
-    """Random centers in the box and random orientations -> (body0, key)."""
+    """Random centers in the box and random orientations -> (body0, key). Overlap can occur"""
     key = random.PRNGKey(seed)
     key, ckey, okey = random.split(key, 3)
     centers = random.uniform(ckey, (n_particles, 2), minval=0.0, maxval=box,
@@ -53,11 +144,6 @@ def random_initial_condition(n_particles, box, seed):
 
 def grid_initial_condition(n_particles, box, seed):
     """Non-overlapping grid of centers with random orientations -> (body0, key).
-
-    ``random_initial_condition`` can drop bodies on top of each other, which at
-    high density gives a huge first-step steric force (and can overflow the
-    neighbor buffer immediately). Starting on a grid avoids that; use it for
-    dense packings, and ``random`` when you want an unbiased start.
     """
     m = int(np.ceil(np.sqrt(n_particles)))
     cell = box / m
@@ -71,15 +157,6 @@ def grid_initial_condition(n_particles, box, seed):
     theta = random.uniform(okey, (n_particles,), minval=-jnp.pi, maxval=jnp.pi,
                            dtype=jnp.float64)
     return rigid_body.RigidBody(centers, theta), key
-
-
-def initial_condition(n_particles, box, seed, init="random"):
-    """Dispatch to ``random_initial_condition`` or ``grid_initial_condition``."""
-    if init == "random":
-        return random_initial_condition(n_particles, box, seed)
-    if init == "grid":
-        return grid_initial_condition(n_particles, box, seed)
-    raise ValueError(f"init must be 'random' or 'grid', got {init!r}")
 
 
 # --------------------------------------------------------------------------
@@ -133,21 +210,45 @@ def make_modulated_drive(intensity_fn, F_body=DEFAULT_F_BODY, tau=DEFAULT_TAU):
 
 
 def shape_radius(shape, sigma):
-    """Circumradius of a body in metres: furthest bead centre + one bead radius.
+    """Circumradius of a body in meters: furthest bead center + one bead radius.
 
     ``shape`` points are in units of sigma (as passed to ``make_runner``). This
     is what ``with_wall`` needs so the whole body stays inside, not just its
-    centre. For ``single_bead_shape`` it is ``sigma/2``.
+    center. For ``single_bead_shape`` it is ``sigma/2``.
     """
     pts = np.asarray(shape.points) * sigma
     return float(np.linalg.norm(pts, axis=-1).max()) + float(sigma) / 2
+
+
+def make_active_optical_drive(FX_pN, FY_pN, TZ_pN_nm, phi_pol=0.0, power=3):
+    """Orientation-dependent optical drive from a fitted design.
+
+    Coefficients are the ``[A, B, C]`` of ``A cos^2(a) + B sin^2(a) + C sin(a)cos(a)``
+    with ``a = phi_pol - theta``. 
+    ``power`` is the 10 uW -> 30 uW scaling.
+
+    Unlike ``make_drive``, the force varies with orientation, so it is
+    rotated per particle into the lab frame.
+    """
+    def drive_fn(body, light):
+        """light is the intensity over time. here we currently cant use light pattern like disk or gradient"""
+        theta = body.orientation
+        F_body, tau = active_force_torque_body(theta, phi_pol, FX=FX_pN,
+                                               FY=FY_pN, TZ=TZ_pN_nm, power=power)
+        R = rigid_body.rotation2d(theta)#body -> lab
+        return jnp.einsum("nij,nj->ni", R, F_body) * light, tau * light
+
+    drive_fn.spec = {"type": "active_optical", "phi_pol": float(phi_pol),
+                     "power": float(power), "FX_pN": list(FX_pN),
+                     "FY_pN": list(FY_pN), "TZ_pN_nm": list(TZ_pN_nm)}
+    return drive_fn
 
 
 def with_wall(drive_fn, box, k=5e-5, body_radius=0.0, margin=0.0):
     """Wrap a drive with a soft wall so bodies stay in the box instead of wrapping.
 
     The wall surface sits ``body_radius + margin`` in from each box edge, and it
-    acts on the body *centre* -- so pass ``body_radius=shape_radius(shape, sigma)``
+    acts on the body *center* -- so pass ``body_radius=shape_radius(shape, sigma)``
     or the body will overhang the wall by its own radius. With the default
     ``margin=0`` the body then just touches the box edge.
 
@@ -163,6 +264,7 @@ def with_wall(drive_fn, box, k=5e-5, body_radius=0.0, margin=0.0):
         c = body.center
         f_wall = k * (jnp.maximum(edge - c, 0.0)
                       - jnp.maximum(c - (box - edge), 0.0))
+        f_wall = f_wall.at[:, 0].set(0.0)   # no wall along the drive (x)
         return f_lab + f_wall, tau
 
     wrapped.spec = {"type": "wall", "k_N_per_m": float(k),
@@ -174,7 +276,7 @@ def with_wall(drive_fn, box, k=5e-5, body_radius=0.0, margin=0.0):
 
 # --- intensity patterns: centers (N,2) [m] -> non-negative scaling (N,) -----
 def intensity_uniform(level=1.0):
-    """Flat pattern -- the identity case, useful as a sweep baseline."""
+    """Flat pattern, the identity case, useful as a sweep baseline."""
     def fn(c):
         return jnp.full(c.shape[0], level, dtype=c.dtype)
     fn.spec = {"pattern": "uniform", "level": float(level)}
@@ -244,8 +346,19 @@ def soft_sphere_interaction(epsilon=5e-17, alpha=2.0, dr_threshold=None,
         neighbor_fn, ss_nl = energy.soft_sphere_neighbor_list(
             displacement_fn, box, sigma=sigma, epsilon=epsilon, alpha=alpha,
             dr_threshold=skin, capacity_multiplier=capacity_multiplier)
+        # The cell list behind the neighbor list needs every bead inside
+        # [0, box). Beads of a body that straddles a periodic edge are not, and
+        # would silently lose their neighbors (bodies then pass through each
+        # other), so bead positions are wrapped first; the displacement is
+        # periodic, so energies and forces are unchanged.
+        def wrap(R):
+            return jnp.mod(R, box)
+
+        wrapped_neighbor_fn = partition.NeighborListFns(
+            lambda R, **kw: neighbor_fn.allocate(wrap(R), **kw),
+            lambda R, nbrs, **kw: neighbor_fn.update(wrap(R), nbrs, **kw))
         nbr_fns, rigid_energy = rigid_body.point_energy_neighbor_list(
-            ss_nl, neighbor_fn, shape)
+            lambda R, **kw: ss_nl(wrap(R), **kw), wrapped_neighbor_fn, shape)
         return quantity.force(rigid_energy), nbr_fns
 
     interaction_fn.spec = {"type": "soft_sphere_neighbor_list",
@@ -295,22 +408,20 @@ def make_runner(n_particles, sigma=1e-6, area_fraction=0.3, box=None,
                 steps_per_sample=100, dt=1e-4, kT=KT_300K,
                 resistance_body=DEFAULT_RESISTANCE_BODY, F_body=DEFAULT_F_BODY,
                 tau=DEFAULT_TAU, epsilon=5e-17, capacity_multiplier=2.0,
-                shape=None, drive_fn=None, interaction_fn=None, init="random",
-                grow_neighbor_buffer=True, max_extra_capacity=256):
+                shape=None, drive_fn=None, interaction_fn=None,
+                init=random_initial_condition,
+                grow_neighbor_buffer=True, max_extra_capacity=256,
+                progress=False):
     """Build the simulator once; reuse it across seeds and light series.
 
     Returns ``run_one(light, seed) -> (centers, angles, box)``. The jitted
     simulation is compiled a single time, so looping over replicas (seeds) or
     over light series of the same length (e.g. a gain sweep) costs no
-    recompilation -- much faster than calling ``run`` in a loop.
+    recompilation, much faster than calling ``run`` in a loop.
 
     ``sigma`` is the *bead* diameter, which for ``single_bead_shape`` is also the
     particle diameter; a multi-bead ``shape`` is scaled by it, so a
-    ``grid_shape(n)`` body has side ``n * sigma``. The default box packs bodies
-    at ``area_fraction`` using the body's real footprint, so it follows ``shape``
-    automatically -- but it is only a density, not a physics check: keep the box
-    above the optical turning radius (~44 um with the default drive) or bodies
-    wrap the periodic cell before they visibly curve.
+    ``grid_shape(n)`` body has side ``n * sigma``.
 
     ``shape``, ``drive_fn`` and ``interaction_fn`` override the defaults built
     from the scalar arguments (``single_bead_shape()``, ``make_drive(F_body,
@@ -318,14 +429,19 @@ def make_runner(n_particles, sigma=1e-6, area_fraction=0.3, box=None,
     respectively). ``F_body``/``tau`` are ignored when ``drive_fn`` is given, as
     are ``epsilon``/``capacity_multiplier`` when ``interaction_fn`` is given.
 
-    ``init`` is ``"random"`` or ``"grid"`` (non-overlapping; better when dense).
+    ``init`` is the initial condition, a callable ``init(n_particles, box, seed)
+    -> (body0, key)``: ``random_initial_condition`` (default) or
+    ``grid_initial_condition`` (non-overlapping; better when dense)
 
     With ``grow_neighbor_buffer`` the Verlet buffer is re-allocated with more
     capacity and the run repeated whenever it overflows, up to
-    ``max_extra_capacity`` -- so a clumping run self-corrects instead of
+    ``max_extra_capacity`. So a clumping run self-corrects instead of
     silently returning wrong forces. The grown buffer is kept for later calls.
     Each growth step re-traces the jitted simulation, so a run that grows is
-    slower; raise ``capacity_multiplier`` to start bigger if it happens often.
+    slower;
+
+    With ``progress`` a tqdm bar advances once per light sample and the wall
+    time of the run is printed at the end.
 
     The returned ``run_one`` carries ``.meta`` (a dict of every parameter, ready
     for ``runs.save_run``) plus ``.box``, ``.sigma`` and ``.shape_points``.
@@ -338,11 +454,11 @@ def make_runner(n_particles, sigma=1e-6, area_fraction=0.3, box=None,
         interaction_fn = soft_sphere_interaction(
             epsilon=epsilon, capacity_multiplier=capacity_multiplier)
 
-    # shape points are in units of sigma -> scale to metres
+    # shape points are in units of sigma -> scale to meters
     shape = shape.set(points=shape.points * sigma)
     shape_points = np.asarray(shape.points)
 
-    # The body's footprint: widest bead-centre span plus one bead diameter.
+    # The body's footprint: widest bead-center span plus one bead diameter.
     # For single_bead_shape the span is 0, so this is exactly sigma and the
     # default box below is identical to the old sigma-based one.
     body_side = float(np.max(shape_points.max(axis=0)
@@ -365,10 +481,15 @@ def make_runner(n_particles, sigma=1e-6, area_fraction=0.3, box=None,
     if use_nl:
         # one reference allocation fixes the neighbor-buffer shape for every
         # seed (simulate re-fills it from the actual positions on its first step)
-        ref_body, _ = initial_condition(n_particles, box, 0, init)
+        ref_body, _ = init(n_particles, box, 0)
         nbrs0 = nbr_fns.allocate(ref_body)
     else:
         nbrs0 = None
+
+    bar = {}                                   # the tqdm bar of the current run
+
+    def tick():
+        bar["tqdm"].update(1)
 
     @jit
     def simulate(state, nbrs, light):
@@ -384,6 +505,8 @@ def make_runner(n_particles, sigma=1e-6, area_fraction=0.3, box=None,
                 return (state, nbrs, ovf), None
 
             carry, _ = lax.scan(inner, carry, xs=None, length=steps_per_sample)
+            if progress:
+                jax.debug.callback(tick) 
             state, nbrs, ovf = carry
             return (state, nbrs, ovf), (state.position.center,
                                         state.position.orientation)
@@ -396,12 +519,18 @@ def make_runner(n_particles, sigma=1e-6, area_fraction=0.3, box=None,
 
     def run_one(light, seed=0):
         light = jnp.asarray(light, dtype=jnp.float64)
-        body0, key = initial_condition(n_particles, box, seed, init)
+        body0, key = init(n_particles, box, seed)
         state = init_fn(key, body0)
         overflowed = False
+        t0 = time.time()
         while True:
+            if progress:
+                from tqdm import tqdm
+                bar["tqdm"] = tqdm(total=len(light), unit="sample")
             centers, angles, ovf = simulate(state, buf["nbrs"], light)
             jax.block_until_ready(centers)
+            if progress:
+                bar["tqdm"].close()
             if not (use_nl and bool(ovf)):
                 break
             if not grow_neighbor_buffer or buf["extra"] >= max_extra_capacity:
@@ -410,12 +539,15 @@ def make_runner(n_particles, sigma=1e-6, area_fraction=0.3, box=None,
                 break
             buf["extra"] += 16
             buf["nbrs"] = nbr_fns.allocate(body0, extra_capacity=buf["extra"])
-            print(f"  neighbor buffer overflow -> retrying with "
+            print(f"neighbor buffer overflow -> retrying with "
                   f"extra_capacity={buf['extra']}")
+        if progress:
+            print(f"simulation took {time.time() - t0:.1f} s")
         run_one.meta["neighbor_buffer_overflow"] = overflowed
         run_one.meta["neighbor_extra_capacity"] = int(buf["extra"])
         return np.asarray(centers), np.asarray(angles), float(box)
 
+    #function is object so we can add the attributes we later need in __main__
     run_one.box = float(box)
     run_one.sigma = float(sigma)
     run_one.shape_points = shape_points
@@ -426,15 +558,14 @@ def make_runner(n_particles, sigma=1e-6, area_fraction=0.3, box=None,
         "sigma_m": float(sigma),
         "box_m": float(box),
         "area_fraction": float(area_fraction),
-        "init": init,
+        "init": getattr(init, "__name__", repr(init)),
         "steps_per_sample": int(steps_per_sample),
         "dt": float(dt),
         "kT": float(kT),
         "temperature_K": float(kT) / K_B,
         "resistance_body": np.asarray(resistance_body).tolist(),
         # drive/interaction describe themselves via a .spec attribute (same
-        # convention as trajectory.make_*_force). A hand-written drive_fn should
-        # set one too, or the run is not reproducible from its metadata.
+        # convention as trajectory.make_*_force).
         "drive": getattr(drive_fn, "spec", "UNSPECIFIED (drive_fn has no .spec)"),
         "interaction": getattr(interaction_fn, "spec",
                                "UNSPECIFIED (interaction_fn has no .spec)"),
@@ -444,55 +575,51 @@ def make_runner(n_particles, sigma=1e-6, area_fraction=0.3, box=None,
     }
     return run_one
 
-
-def run(light, n_particles=20, sigma=1e-6, area_fraction=0.3, box=None,
-        steps_per_sample=100, dt=1e-4, kT=KT_300K,
-        resistance_body=DEFAULT_RESISTANCE_BODY, F_body=DEFAULT_F_BODY,
-        tau=DEFAULT_TAU, epsilon=5e-17, capacity_multiplier=2.0, seed=0,
-        shape=None, drive_fn=None, interaction_fn=None, init="random",
-        grow_neighbor_buffer=True, max_extra_capacity=256):
-    """Single run of the swarm driven by the light series ``light``.
-
-    Thin wrapper over ``make_runner`` -- see it for what ``shape``, ``drive_fn``,
-    ``interaction_fn`` and ``init`` do. Returns ``centers (n_samples, N, 2)``,
-    ``angles (n_samples, N)`` and ``box``. For many runs sharing geometry
-    (replicas, a gain sweep), call ``make_runner`` once and reuse ``run_one``.
-    """
-    runner = make_runner(
-        n_particles, sigma=sigma, area_fraction=area_fraction, box=box,
-        steps_per_sample=steps_per_sample, dt=dt, kT=kT,
-        resistance_body=resistance_body, F_body=F_body, tau=tau, epsilon=epsilon,
-        capacity_multiplier=capacity_multiplier, shape=shape, drive_fn=drive_fn,
-        interaction_fn=interaction_fn, init=init,
-        grow_neighbor_buffer=grow_neighbor_buffer,
-        max_extra_capacity=max_extra_capacity)
-    return runner(light, seed)
-
-
 if __name__ == "__main__":
-    from render_swarm import make_video
-    from runs import save_run
-
-    sigma = 1e-6
-    n_samples = 1000
     seed = 0
-    t = np.arange(n_samples)
-    u = 2 + 0.5 * np.sin(2 * np.pi * t / 50.0)   # input signal as intensity >= 0
-    u = np.ones(4000) * 1.5 
 
+    # --- particle --------------------------------------------------------------
+    body_side = 10e-6                 # side of one square body [m]
+    n_grid    = 5                     # body side in units of sigma
+    sigma     = body_side / n_grid    # bead diameter = 2 um
+    spacing   = 0.5                   # bead spacing in units of sigma (was 0.25)
+    soft      = 0.4                   # contact softening (2.5x softer than before)
+    
+    sigma = 10e-6
+    shape = single_bead_shape()
 
-    N, sigma, ng, phi = 200, 1e-6, 3, 0.4
-    body = ng * sigma                          # 3 um square bodies
-    box  = body * np.sqrt(N / phi)             # = 67.1 um
-    u    = np.ones(1600)                        # 800 x 100 x 1e-3 = 80 s simulated
+    epsilon = 5e-17 * (sigma / 1e-6) ** 2          # eps/sigma^2 = 5e-5 N/m per bead pair
+    # shape   = perimeter_shape(n_grid, spacing)
+    # epsilon = epsilon * spacing * soft             # same face stiffness as grid_shape, x soft
 
+    # --- swarm and box ---------------------------------------------------------
+    N   = 115
+    box = 150e-6
 
-    shp = grid_shape(3)
-    rad = shape_radius(shp, sigma)
-    drive = with_wall(make_drive(), box, k=5e-5, body_radius=rad, margin=1e-7)
-    runner = make_runner(n_particles=N, sigma=sigma, box=box, init="grid",
-                     shape=grid_shape(ng), drive_fn=drive,
-                     dt=1e-3, steps_per_sample=100, capacity_multiplier=5.0)
+    # --- time ------------------------------------------------------------------
+    T_total  = 400.0                  # simulated time [s]
+    t_sample = 0.5                    # time between saved frames [s]
+    dt       = 4e-4 
+    steps_per_sample = int(round(t_sample / dt))   # 1250
+    u = np.ones(int(round(T_total / t_sample)))    # 800 samples
+    light_signal = "constant 1.0"
+
+    FX = [1.24171, 0.443034, 0.0] #desing1_res60_linear_30uW
+    FY = [0.0, 0.0, 0.066536]
+    TZ = [0, 0, 244.48]
+    # drive = with_wall(make_active_optical_drive(FX, FY, TZ, phi_pol=0.0),
+    #                 box, k=5e-5, body_radius=rad, margin=1e-7)
+    drive = make_active_optical_drive(FX, FY, TZ, phi_pol=0.0)
+    F_body = (1.135e-12, 0.0)
+    tau    = 966e-21 
+    drive = make_drive(F_body=F_body,tau=tau)
+    # drive = with_wall(make_drive(), box, k=5e-5, body_radius=rad, margin=1e-7)
+    init = make_ring_init(88e-6,np.sign(tau) * np.pi / 2)
+    runner = make_runner(n_particles=N, sigma=sigma, box=box,
+                     init=init,
+                     shape=shape, drive_fn=drive, epsilon=epsilon,
+                     dt=dt, steps_per_sample=steps_per_sample,
+                     capacity_multiplier=5.0, progress=True)
 
     centers, angles, box = runner(u, seed=seed)
     print(f"centers {centers.shape}, angles {angles.shape}, box {box:.2e} m")
@@ -500,8 +627,12 @@ if __name__ == "__main__":
     run_dir = save_run(
         arrays={"centers": centers, "angles": angles, "light": u,
                 "box": box, "sigma": sigma, "body_points": runner.shape_points},
-        meta={**runner.meta, "n_samples": int(n_samples), "seed": seed,
-              "light_signal": "2 + 0.5*sin(2*pi*t/50)"},
-        label="uniform_sin", prefix="swarm", source=__file__)
+        meta={**runner.meta, "n_samples": len(u), "seed": seed,
+              "light_signal": light_signal},
+        label="ring", prefix="swarm", source=__file__)
 
-    make_video(run_dir, out_path=str(run_dir / "animation.mp4"),body="square")
+    fps = 24
+    # target_frames = round(len(u) * steps_per_sample * dt * fps)
+    target_frames = round(len(u))
+
+    make_video(run_dir, out_path=str(run_dir / "animation.mp4"),body="disk",target_frames=target_frames,fps=fps)

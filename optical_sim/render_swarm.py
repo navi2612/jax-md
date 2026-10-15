@@ -109,7 +109,7 @@ def make_video(run, out_path="swarm.mp4", target_frames=240,
     mode, pts, side = _body_geometry(run, body, body_points, body_side, sigma)
     head_len = 0.5 * (side if mode == "square" else sigma)
 
-    skip = max(1, T_all // target_frames)
+    skip = max(1, int(T_all // target_frames))
     C = centers[::skip]
     A = angles[::skip]
     T = C.shape[0]

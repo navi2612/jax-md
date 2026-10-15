@@ -12,14 +12,18 @@ from jax import random, lax, grad, vmap
 
 from jax_md import energy, space
 
-# Local integrator, decoupled from the jax-md package so jax-md can be upgraded
-# freely (see brownian_generalized_2d.py).
 from brownian_generalized_2d import brownian_generalized_2d
 
-K_B = 1.380649e-23                                 # Boltzmann constant [J/K]
+import active_optical
+from active_optical import active_force_torque_body
+
+import matplotlib.pyplot as plt
+from matplotlib import animation
+from matplotlib.patches import Polygon
 
 
-KT_300K = jnp.float64(1.38e-23 * 300.0)            # k_B T  [J]
+K_B = 1.380649e-23
+KT_300K = jnp.float64(1.38e-23 * 300.0)
 
 # Body-frame resistance (drag) matrix: diag(gamma_x, gamma_y, gamma_rot).
 # Translational entries in N.s/m, rotational entry in N.m.s.
@@ -42,7 +46,6 @@ def rotation_2d(theta):
 
 def lab_to_body_force(theta, F_lab):
     """Rotate a lab-frame force into the particle body frame.
-
     The rotation matrix is orthogonal, so the lab->body map is its transpose.
     """
     return rotation_2d(theta).T @ F_lab
@@ -80,7 +83,7 @@ def make_constant_force(Fx=0.0, Fy=0.0, tau=0.0):
     return force_fn_body
 
 
-def make_active_optical_force(phi_pol=0.0, interaction_energy_fn=None):
+def make_active_optical_force(FX_pN, FY_pN, TZ_pN_nm,phi_pol=0.0, interaction_energy_fn=None):
     """Orientation-dependent optical force/torque from ``active_optical``.
 
     Args:
@@ -91,16 +94,13 @@ def make_active_optical_force(phi_pol=0.0, interaction_energy_fn=None):
 
     Returns a ``force_fn_body(q) -> (N, 3)``.
     """
-    import active_optical
-    from active_optical import active_force_torque_body
-
     grad_energy_fn = grad(interaction_energy_fn) if interaction_energy_fn else None
 
     def force_fn_body(q, **kwargs):
         theta = q[:, 2]
 
         # orientation-dependent optical active force/torque (body frame)
-        F_active_body, tau_active_body = active_force_torque_body(theta, phi_pol)
+        F_active_body, tau_active_body = active_force_torque_body(theta, phi_pol,TZ=TZ_pN_nm,FX=FX_pN,FY=FY_pN)
         F_active_body = F_active_body.astype(q.dtype)
         tau_active_body = tau_active_body.astype(q.dtype)
 
@@ -115,24 +115,21 @@ def make_active_optical_force(phi_pol=0.0, interaction_energy_fn=None):
         tau = tau_active_body
         return jnp.concatenate([F_body, tau[:, None]], axis=1)
 
-    # record the fitted model coefficients so a run is reproducible even if the
-    # active_optical module is later re-fitted.
     force_fn_body.spec = {
         "type": "active_optical",
         "phi_pol": float(phi_pol),
         "fitted_coefficients": {
-            "FX_pN": list(active_optical._FX),
-            "FY_pN": list(active_optical._FY),
-            "TZ_pN_nm": list(active_optical._TZ),
+            "FX_pN": list(FX_pN),
+            "FY_pN": list(FY_pN),
+            "TZ_pN_nm": list(TZ_pN_nm),
         },
         "interaction": getattr(interaction_energy_fn, "spec", None),
     }
     return force_fn_body
 
 
-def make_soft_sphere_energy(sigma=2.0e-6, epsilon=1.0e-18, alpha=2.0,
-                            k_trap=0.0):
-    """Lab-frame centre energy: soft-sphere pair repulsion + optional trap.
+def make_soft_sphere_energy(sigma=2.0e-6, epsilon=1.0e-18, alpha=2.0):
+    """Lab-frame center energy: soft-sphere pair repulsion.
 
     Returns ``energy_fn(q) -> scalar`` suitable for ``interaction_energy_fn``.
     """
@@ -143,13 +140,10 @@ def make_soft_sphere_energy(sigma=2.0e-6, epsilon=1.0e-18, alpha=2.0,
     def energy_fn(q):
         R = q[:, :2]
         U = pair_energy_fn(R)
-        if k_trap:
-            U = U + 0.5 * k_trap * jnp.sum(R ** 2)
         return U
 
     energy_fn.spec = {"type": "soft_sphere", "sigma": float(sigma),
-                      "epsilon": float(epsilon), "alpha": float(alpha),
-                      "k_trap": float(k_trap)}
+                      "epsilon": float(epsilon), "alpha": float(alpha),}
     return energy_fn
 
 
@@ -250,48 +244,44 @@ def render_video(
 
     Args:
       traj: ``(n_steps, N, 3)`` array of ``[x, y, theta]``.
-      out_path: output file; extension picks the writer (``.mp4`` needs ffmpeg,
-        ``.gif`` uses Pillow).
-      pos_units: ``"um"`` to plot in micrometres, otherwise metres.
+      out_path: output file; extension picks the writer
+      pos_units: ``"um"`` to plot in micrometers, otherwise meters.
       fps: frames per second of the output video.
       n_frames: number of frames to render (trajectory is subsampled to this).
-      particle_um: side length of the square particle marker, in micrometres.
-      track_corner: if True, draw the red centre + blue corner trajectory pair;
-        if False, draw a single centre trajectory line per particle.
+      particle_um: side length of the square particle marker, in micrometers.
+      track_corner: if True, draw the red center + blue corner trajectory pair;
+        if False, draw a single center trajectory line per particle.
       dt: optional time step [s]; if given, a "t = ... s" clock is drawn.
       dpi: output resolution.
 
     Returns the saved ``out_path``.
     """
-    import matplotlib.pyplot as plt
-    from matplotlib import animation
-    from matplotlib.patches import Polygon
 
-    traj = np.asarray(traj)                       # (T, N, 3)
+    traj = np.asarray(traj) #(T, N, 3)
     scale = 1e6 if pos_units == "um" else 1.0
-    xy = traj[..., :2] * scale                    # (T, N, 2) particle centres
-    theta = traj[..., 2]                          # (T, N)
+    xy = traj[..., :2] * scale  #(T, N, 2) particle centers
+    theta = traj[..., 2]   #(T, N)
     T, N = theta.shape
 
     # square side in plot units (plot is µm when pos_units == "um", else m)
     side = particle_um if pos_units == "um" else particle_um * 1e-6
     half_sq = side / 2.0
-    # unit-square corners in the body frame, centred on the particle
+    # unit-square corners in the body frame, centered on the particle
     base = np.array([[-half_sq, -half_sq], [half_sq, -half_sq],
                      [half_sq, half_sq], [-half_sq, half_sq]])
-    corner_off = np.array([half_sq, half_sq])     # the tracked (blue) corner
+    corner_off = np.array([half_sq, half_sq])  # the tracked (blue) corner
 
     def square_corners(cx, cy, th):
         c, s = np.cos(th), np.sin(th)
         rot = np.array([[c, -s], [s, c]])
         return base @ rot.T + np.array([cx, cy])
 
-    # corner trajectory: centre + body-frame corner offset rotated by theta
-    c_all, s_all = np.cos(theta), np.sin(theta)   # (T, N)
+    # corner trajectory: center + body-frame corner offset rotated by theta
+    c_all, s_all = np.cos(theta), np.sin(theta)   #(T, N)
     corner_xy = np.stack([
         xy[..., 0] + c_all * corner_off[0] - s_all * corner_off[1],
         xy[..., 1] + s_all * corner_off[0] + c_all * corner_off[1],
-    ], axis=-1)                                   # (T, N, 2)
+    ], axis=-1)  #(T, N, 2)
 
     # evenly-spaced frame indices into the full trajectory
     frames = np.linspace(0, T - 1, min(n_frames, T)).astype(int)
@@ -412,7 +402,7 @@ def simulate_and_save(
       - ``trajectory.mp4`` : an animation (only if ``video=True``)
 
     All ``run_brownian_2d`` arguments are accepted and recorded. ``label`` is an
-    optional human-readable tag appended to the folder name; ``extra_metadata``
+    optional tag appended to the folder name; ``extra_metadata``
     is an optional dict merged into the saved metadata. Set ``video=True`` to
     also render an animation; ``video_kwargs`` is an optional dict forwarded to
     ``render_video`` (e.g. ``{"n_frames": 500, "fps": 30}``).
@@ -475,17 +465,21 @@ def simulate_and_save(
 
 
 # --------------------------------------------------------------------------
-# example: single point-like particle (reproduces the brownian_2d cell)
+# example: single point-like particle
 # --------------------------------------------------------------------------
 if __name__ == "__main__":
     energy_fn = make_soft_sphere_energy(sigma=2.0e-6, epsilon=1.0e-18, alpha=2.0)
-    force_fn = make_active_optical_force(phi_pol=0.0, interaction_energy_fn=energy_fn)
-    force_fn = make_constant_force(0.8394827599084255e-12*3, 0.04396073481598326e-12*3,-1259.8000362536472e-21*3)
+    # force_fn = make_constant_force(0.8394827599084255e-12*3, 0.04396073481598326e-1230*3,-1259.8000362536472e-21*3)
 
-    q0 = [0.0, 0.0, 0.0]
+    FX = [1.24171, 0.443034, 0.0] #desing1_res60_linear_30uW
+    FY = [0.0, 0.0, 0.066536]
+    TZ = [0, 0, 244.48]
+    force_fn = make_active_optical_force(FX,FY,TZ,phi_pol=0.0, interaction_energy_fn=energy_fn)
+
+    q0 = [0.0, 0.0, np.deg2rad(30.0)]   # start 30 deg off the polarisation (x) axis
 
     # the 30uw comes from active_optical where i multiply by 3x to go from 10uw to 30uw for the force and torque
     run_dir, traj, state = simulate_and_save(
-        force_fn, q0, n_steps=300000, dt=1e-4, label="desing1_res60_circular_30uW",
+        force_fn, q0, n_steps=300000, dt=1e-4, label="desing1_res60_linear_30uW_restoring_30deg_noise",
         video=True, video_kwargs={"n_frames": 400, "fps": 30})
     print("trajectory shape:", traj.shape)

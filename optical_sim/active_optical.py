@@ -12,13 +12,13 @@ a different one -- a saved run's metadata.json holds its own.
 
 import jax.numpy as jnp
 
-_PN = 1e-12      # pN  -> N
-_PN_NM = 1e-21   # pN.nm -> N.m
+_PN = 1e-12 #pN  -> N
+_PN_NM = 1e-21 #pN.nm -> N.m
 
 #Fit coefficients A, B, C
-_FX = [0.0, 0.0, 0.0]      # pN
-_FY = [0.0, 0.0, 0.0]  # pN
-_TZ = [-2655.25, -2655.14, -0.109236]  # pN.nm
+_FX = [0.0, 0.0, 0.0] #pN
+_FY = [0.0, 0.0, 0.0] #pN
+_TZ = [-2655.25, -2655.14, -0.109236] #pN.nm
 
 
 def active_force_torque_body(theta, phi_pol, FX=None, FY=None, TZ=None, power=3):
@@ -26,7 +26,7 @@ def active_force_torque_body(theta, phi_pol, FX=None, FY=None, TZ=None, power=3)
     FY = _FY if FY is None else FY
     TZ = _TZ if TZ is None else TZ
 
-    alpha = phi_pol - theta # relative angle; note the minus theta
+    alpha = phi_pol - theta # relative angle
     c, s = jnp.cos(alpha), jnp.sin(alpha)
 
     tau_z = TZ[0] * c*c + TZ[1] * s*s + TZ[2] * s*c
