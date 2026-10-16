@@ -410,7 +410,7 @@ def make_runner(n_particles, sigma=1e-6, area_fraction=0.3, box=None,
                 tau=DEFAULT_TAU, epsilon=5e-17, capacity_multiplier=2.0,
                 shape=None, drive_fn=None, interaction_fn=None,
                 init=random_initial_condition,
-                grow_neighbor_buffer=True, max_extra_capacity=256,
+                grow_neighbor_buffer=True, max_extra_capacity=256,initial_extra_capacity=0,
                 progress=False):
     """Build the simulator once; reuse it across seeds and light series.
 
@@ -482,7 +482,7 @@ def make_runner(n_particles, sigma=1e-6, area_fraction=0.3, box=None,
         # one reference allocation fixes the neighbor-buffer shape for every
         # seed (simulate re-fills it from the actual positions on its first step)
         ref_body, _ = init(n_particles, box, 0)
-        nbrs0 = nbr_fns.allocate(ref_body)
+        nbrs0 = nbr_fns.allocate(ref_body,extra_capacity=initial_extra_capacity)
     else:
         nbrs0 = None
 
