@@ -164,10 +164,12 @@ def bimodality_coefficient(x):
     return (g**2 + 1) / (k + 3 * (n - 1) ** 2 / ((n - 2) * (n - 3)))
 
 
-def lane_segregation(pos, s, box, half_width):
-    """Mean fraction of same-direction particles among those within |dy| <
-    half_width (whole box length in x). 0.5 = mixed, 1 = perfect lanes."""
-    dy = pos[:, 1][:, None] - pos[:, 1][None, :]
+def lane_segregation(pos, s, box, half_width, perp_axis=1):
+    """Mean fraction of same-direction particles among those within
+    |d(perp)| < half_width (whole box length along the drive). perp_axis is the
+    coordinate perpendicular to the drive (1 = y for drive along x).
+    0.5 = mixed, 1 = perfect lanes."""
+    dy = pos[:, perp_axis][:, None] - pos[:, perp_axis][None, :]
     dy -= box * np.round(dy / box)
     m = np.abs(dy) < half_width
     np.fill_diagonal(m, False)
@@ -186,11 +188,13 @@ def profile_contrast(pos, box, nb, axis):
 
 def analyze_run(centers, box, t_sample, v0, diameter=DIAMETER,
                 t_start=None, r_contact_factor=1.05, cell_factor=3.0,
-                blocked_threshold=0.5, angles=None):
+                blocked_threshold=0.5, angles=None, pol=None):
     """Steady-state observables from one run (averaged over t >= t_start).
 
     centers: (T, N, 2) [m], angles: (T, N) [rad] (optional, needed for the
-    drive-direction observables). Returns a dict of floats plus time series.
+    drive-direction observables), pol: (T,) polarization angle per frame
+    (linear drive; default 0). Drive-direction observables are measured
+    relative to the current polarization axis. Returns floats + time series.
     """
     T = len(centers)
     t = np.arange(T) * t_sample
@@ -214,19 +218,32 @@ def analyze_run(centers, box, t_sample, v0, diameter=DIAMETER,
 
     out_dir_obs = {}
     if angles is not None:
-        s = np.sign(np.cos(angles))                                # +1 / -1 along x
-        drift = s[:-1] * d[..., 0] / t_sample                      # velocity along own direction
-        out_dir_obs["drive_mob"] = float(drift[sel[sel > 0] - 1].mean() / v0)
-        out_dir_obs["nematic_S"] = float(np.abs(np.exp(2j * angles[sel]).mean(1)).mean())
+        switching = pol is not None and np.ptp(np.asarray(pol)) > 0
+        pol_f = np.zeros(T) if pol is None else np.asarray(pol, float)[:T]
+        rel = angles - pol_f[:, None]                              # angle to current axis
+        s = np.sign(np.cos(rel))                                   # +1 / -1 along the axis
+        e = np.stack([np.cos(pol_f), np.sin(pol_f)], -1)           # axis unit vector per frame
+        v_par = (d * e[1:, None, :]).sum(-1) / t_sample            # velocity along the axis
+        mob_t = np.r_[np.nan, (s[1:] * v_par).mean(1) / v0]        # along own direction
+        S_t = np.cos(2 * rel).mean(1)                              # +1 aligned, -1 perpendicular
+        ax_drive = np.where(np.cos(2 * pol_f) > 0, 0, 1)           # 0: axis = x, 1: axis = y
+        frames = (np.arange(T) if switching else sel[:: max(1, len(sel) // 100)])
+        lane_t = np.full(T, np.nan)
+        for k in frames:
+            lane_t[k] = lane_segregation(np.mod(centers[k], box), s[k], box,
+                                         0.5 * diameter, perp_axis=1 - ax_drive[k])
         sub = sel[:: max(1, len(sel) // 100)]
-        out_dir_obs["lane_seg"] = float(np.nanmean(
-            [lane_segregation(np.mod(centers[k], box), s[k], box, 0.5 * diameter)
-             for k in sub]))
         nb = max(int(box // (cell_factor * diameter)), 1)
-        out_dir_obs["band_x"] = float(np.mean([profile_contrast(centers[k], box, nb, 0)
-                                               for k in sub]))
-        out_dir_obs["band_y"] = float(np.mean([profile_contrast(centers[k], box, nb, 1)
-                                               for k in sub]))
+        out_dir_obs["drive_mob"] = float(np.nanmean(mob_t[sel]))
+        out_dir_obs["nematic_S"] = float(S_t[sel].mean())
+        out_dir_obs["lane_seg"] = float(np.nanmean(lane_t[sel]))
+        # band_x: density stripes along the drive axis (jams across the drive),
+        # band_y: along the perpendicular axis (lanes of different density)
+        out_dir_obs["band_x"] = float(np.mean(
+            [profile_contrast(centers[k], box, nb, ax_drive[k]) for k in sub]))
+        out_dir_obs["band_y"] = float(np.mean(
+            [profile_contrast(centers[k], box, nb, 1 - ax_drive[k]) for k in sub]))
+        out_dir_obs.update({"mob_t": mob_t, "S_t": S_t, "lane_t": lane_t})
 
     return {
         **out_dir_obs,
@@ -279,6 +296,8 @@ def render_run(npz_path, out_path=None, fps=20, max_frames=600, diameter=DIAMETE
     t_sample = float(z["t_sample"])
     N = centers.shape[1]
     d = diameter * 1e6
+    pol = z["pol"] if "pol" in z.files else np.zeros(len(centers))
+    switching = np.ptp(pol) > 0
     frames = np.unique(np.linspace(0, len(centers) - 1,
                                    min(max_frames, len(centers))).astype(int))
 
@@ -297,14 +316,16 @@ def render_run(npz_path, out_path=None, fps=20, max_frames=600, diameter=DIAMETE
         fig.colorbar(sm, ax=ax, fraction=0.046, pad=0.03, label="cluster size / N")
     title = ax.set_title("")
     params = (_run_label(z) + f", φ = {float(z['phi']):.2f}, N = {N}"
-              + ("   (red → +x, blue → −x)" if linear else ""))
+              + ("" if not linear else
+                 "\nred/blue = +/− along the current polarization axis" if switching
+                 else "   (red → +x, blue → −x)"))
 
     def draw(k):
         p = np.mod(centers[k], box)
         size = cluster_sizes_per_particle(p * 1e-6, box * 1e-6,
                                           r_contact_factor * diameter)
         if linear:
-            col = np.where(np.cos(angles[k])[:, None] > 0,
+            col = np.where(np.cos(angles[k] - pol[k])[:, None] > 0,
                            np.array([[0.84, 0.15, 0.16, 0.9]]),
                            np.array([[0.12, 0.37, 0.75, 0.9]]))
         else:
@@ -314,7 +335,8 @@ def render_run(npz_path, out_path=None, fps=20, max_frames=600, diameter=DIAMETE
         disks.set_facecolors(col)
         tip = p + 0.5 * d * np.c_[np.cos(angles[k]), np.sin(angles[k])]
         heads.set_segments(np.stack([p, tip], 1))
-        title.set_text(f"{params}\nt = {k*t_sample:.0f} s,  largest cluster = "
+        polstr = f",  polarization {np.degrees(pol[k]):.0f}°" if switching else ""
+        title.set_text(f"{params}\nt = {k*t_sample:.0f} s{polstr},  largest cluster = "
                        f"{size.max()/N:.2f}")
         return disks, heads, title
 
@@ -366,7 +388,38 @@ def plot_run_summary(npz_path, out_path=None, diameter=DIAMETER, cell_factor=3.0
     ax[1].set_xlabel(f"local area fraction ({cell_factor:.0f}d cells)")
     ax[1].set_ylabel("probability density"); ax[1].legend()
     ax[1].set_title("one peak: homogeneous   two peaks: phase separation")
-    if linear:
+    pol = z["pol"] if "pol" in z.files else np.zeros(len(t))
+    switching = linear and np.ptp(pol) > 0
+    if switching:
+        T_sw = float(z["switch_s"])
+        for m in np.arange(T_sw, t[-1], T_sw):
+            ax[0].axvline(m, color="0.6", lw=0.6, ls=":")
+        ax[0].set_title("dotted lines: polarization switches")
+        S_t, lane_t, mob_t = z["S_t"], z["lane_t"], z["mob_t"]
+        a = axs[1, 0]
+        a.plot(t, S_t, lw=1, label="alignment with current axis")
+        a.plot(t, lane_t, lw=1, label="lanes (0.5 = mixed)")
+        a.plot(t, mob_t, lw=1, label="flow along own direction / v₀")
+        for m in np.arange(T_sw, t[-1], T_sw):
+            a.axvline(m, color="0.6", lw=0.6, ls=":")
+        a.set_ylim(-1.05, 1.05); a.set_xlabel("time (s)"); a.legend(fontsize=8, loc="lower left")
+        a.set_title("order parameters vs time")
+        # average over all cycles after the first one, vs time since the last switch
+        b = axs[1, 1]
+        tau = np.mod(t, T_sw)
+        use = t >= T_sw
+        bins = np.arange(0, T_sw + float(z["t_sample"]), float(z["t_sample"]))
+        idx = np.digitize(tau[use], bins) - 1
+        for series, lab in ((lcf_t, "largest cluster"), (S_t, "alignment"),
+                            (lane_t, "lanes"), (mob_t, "flow / v₀")):
+            y = series[use]
+            m = np.array([np.nanmean(y[idx == i]) if np.any(idx == i) else np.nan
+                          for i in range(len(bins) - 1)])
+            b.plot(bins[:-1], m, lw=1.4, label=lab)
+        b.set_xlabel("time since last switch (s)"); b.set_ylim(-1.05, 1.05)
+        b.legend(fontsize=8, loc="lower right")
+        b.set_title(f"average cycle ({int(use.sum() * float(z['t_sample']) // T_sw)} cycles)")
+    elif linear:
         nb = max(int(box // diameter), 1)
         ang = z["angles"]
         edges = np.linspace(0, box, nb + 1)
@@ -395,9 +448,38 @@ def plot_run_summary(npz_path, out_path=None, diameter=DIAMETER, cell_factor=3.0
     return out_path
 
 
+def make_switching_drive(FX, FY, TZ, power=LIN_POWER):
+    """Linear-polarization drive whose *polarization angle* comes from the
+    per-sample ``light`` value (intensity fixed at 1). Uses your
+    active_optical.active_force_torque_body, so it is the same physics as
+    make_active_optical_drive, only with a time-dependent phi_pol."""
+    import jax.numpy as jnp
+    from jax_md import rigid_body
+    from active_optical import active_force_torque_body
+
+    def drive_fn(body, light):
+        theta = body.orientation
+        F_body, tau = active_force_torque_body(theta, light, FX=list(FX), FY=list(FY),
+                                               TZ=list(TZ), power=power)
+        R = rigid_body.rotation2d(theta)                         # body -> lab
+        return jnp.einsum("nij,nj->ni", R, F_body), tau
+
+    drive_fn.spec = {"type": "switching_linear", "power": float(power),
+                     "FX_pN": list(FX), "FY_pN": list(FY), "TZ_pN_nm": list(TZ)}
+    return drive_fn
+
+
+def polarization_schedule(n_samples, t_sample, switch_period):
+    """0 for the first period, pi/2 for the next, 0 again, ... (one value per sample)."""
+    k = np.arange(n_samples)
+    return (np.pi / 2) * (np.floor(k * t_sample / switch_period) % 2)
+
+
 def _run_label(z):
     if "drive" in z.files and str(z["drive"]) == "linear":
-        return "linear polarization"
+        sw = float(z["switch_s"]) if "switch_s" in z.files else np.nan
+        return ("linear polarization" if not np.isfinite(sw)
+                else f"linear, switched by 90° every {sw:.0f} s")
     return f"$R_T$ = {float(z['R_T'])*1e6:.0f} µm"
 
 
@@ -410,7 +492,7 @@ def run_mips_point(R_T, phi, box, T_total, seeds=(0, 1), t_sample=1.0, dt=5e-4,
                    out_dir="mips_runs", verbose=True, video=True, summary_plot=True,
                    video_max_frames=600, initial_extra_capacity=16,
                    drive="circular", lin_coeffs=(LIN_FX, LIN_FY, LIN_TZ),
-                   lin_power=LIN_POWER):
+                   lin_power=LIN_POWER, switch_period=None):
     """Simulate one (R_T, phi) point for several seeds and return the observables.
 
     Returns a dict with the parameters, seed-averaged observables (``*_mean``
@@ -427,10 +509,22 @@ def run_mips_point(R_T, phi, box, T_total, seeds=(0, 1), t_sample=1.0, dt=5e-4,
 
     N = n_for_phi(phi, box, diameter)
     phi_real = N * np.pi * (diameter / 2) ** 2 / box**2
+    n_samples = int(round(T_total / t_sample))
+    u = np.ones(n_samples)                                  # light signal per sample
+    pol = None
     if drive == "linear":
         FX, FY, TZ = lin_coeffs
-        drive_fn = sim.make_active_optical_drive(list(FX), list(FY), list(TZ),
-                                                 phi_pol=0.0, power=lin_power)
+        if switch_period:
+            # the light channel carries the polarization angle instead of intensity
+            drive_fn = make_switching_drive(FX, FY, TZ, power=lin_power)
+            pol = polarization_schedule(n_samples, t_sample, switch_period)
+            u = pol.copy()
+            if T_total < 4 * switch_period:
+                print(f"  WARNING: only {T_total/switch_period:.1f} switching periods")
+        else:
+            drive_fn = sim.make_active_optical_drive(list(FX), list(FY), list(TZ),
+                                                     phi_pol=0.0, power=lin_power)
+            pol = np.zeros(n_samples)
         v0 = FX[0] * 1e-12 * lin_power / rb[0, 0]          # speed when aligned
         tau, omega, period, R_T = 0.0, 0.0, np.nan, np.nan
         k_align = TZ[2] * 1e-21 * lin_power / 2 / rb[2, 2]  # tau = (TZ/2) sin 2a
@@ -449,7 +543,6 @@ def run_mips_point(R_T, phi, box, T_total, seeds=(0, 1), t_sample=1.0, dt=5e-4,
             print(f"  WARNING: run is only {T_total/period:.1f} rotation periods")
 
     steps_per_sample = int(round(t_sample / dt))
-    u = np.ones(int(round(T_total / t_sample)))
 
     runner_kw = dict(
         n_particles=N, sigma=diameter, box=box,
@@ -472,17 +565,21 @@ def run_mips_point(R_T, phi, box, T_total, seeds=(0, 1), t_sample=1.0, dt=5e-4,
     for seed in seeds:
         t0 = time.time()
         centers, angles, _ = runner(u, seed=seed)
-        res = analyze_run(centers, box, t_sample, v0, diameter, angles=angles)
+        res = analyze_run(centers, box, t_sample, v0, diameter, angles=angles, pol=pol)
         res["seed"] = seed
         res["wall_s"] = time.time() - t0
         per_seed.append(res)
-        head = "LIN" if drive == "linear" else f"RT{R_T*1e6:.0f}"
+        head = ("RT%.0f" % (R_T * 1e6) if drive != "linear"
+                else ("LIN_sw%.0f" % switch_period if switch_period else "LIN"))
         tag = f"{head}_phi{phi:.2f}_box{box*1e6:.0f}_s{seed}"
         npz = os.path.join(out_dir, tag + ".npz")
         np.savez_compressed(npz, centers=centers, angles=angles, box=box,
                             t_sample=t_sample, R_T=R_T, phi=phi_real, N=N,
                             tau=tau, F=F, v0=v0, omega=omega, lcf_t=res["lcf_t"],
-                            drive=drive)
+                            drive=drive,
+                            switch_s=switch_period if switch_period else np.nan,
+                            **({"pol": pol, "mob_t": res["mob_t"], "S_t": res["S_t"],
+                                "lane_t": res["lane_t"]} if pol is not None else {}))
         if verbose:
             extra = (f"  drive_mob={res['drive_mob']:.2f}  lanes={res['lane_seg']:.2f}"
                      if drive == "linear" else "")
@@ -497,7 +594,8 @@ def run_mips_point(R_T, phi, box, T_total, seeds=(0, 1), t_sample=1.0, dt=5e-4,
             if verbose:
                 print(f"    video -> {path} ({time.time() - t1:.0f} s)")
 
-    out = {"drive": drive, "R_T_um": R_T * 1e6, "R_T_over_d": R_T / diameter, "phi": phi_real,
+    out = {"drive": drive, "switch_s": switch_period if switch_period else np.nan,
+           "R_T_um": R_T * 1e6, "R_T_over_d": R_T / diameter, "phi": phi_real,
            "N": N, "box_um": box * 1e6, "tau_pNnm": tau * 1e21,
            "period_s": period, "T_total_s": T_total, "per_seed": per_seed}
     for k in SUMMARY_KEYS:
@@ -523,36 +621,43 @@ def print_table(rows):
     if lin:
         if circ:
             print()
-        head = (f"linear  {'phi':>5} {'N':>5} | {'drive_mob':>9} {'lanes':>5} "
+        head = (f"{'T_sw':>6}  {'phi':>5} {'N':>5} | {'drive_mob':>9} {'lanes':>5} "
                 f"{'S':>5} {'band_x':>6} {'band_y':>6} | {'lcf':>5} {'bimod':>6} "
                 f"{'sd_phi':>6} {'blocked':>7}")
         print(head); print("-" * len(head))
         for r in lin:
-            print(f"{'':6}  {r['phi']:5.2f} {r['N']:5d} | {r['drive_mob']:9.2f} "
+            sw = r.get("switch_s", np.nan)
+            swtxt = "static" if not np.isfinite(sw) else f"{sw:.0f} s"
+            print(f"{swtxt:>6}  {r['phi']:5.2f} {r['N']:5d} | {r['drive_mob']:9.2f} "
                   f"{r['lane_seg']:5.2f} {r['nematic_S']:5.2f} {r['band_x']:6.2f} "
                   f"{r['band_y']:6.2f} | {r['lcf_mean']:5.2f} {r['bimodality']:6.2f} "
                   f"{r['phi_loc_std']:6.2f} {r['blocked_frac']:7.2f}")
         print("  drive_mob: speed along own direction / v0 (1 = free flow, ~0 = jammed)\n"
               "  lanes: same-direction share of y-neighbours (0.5 = mixed, 1 = lanes)\n"
-              "  S: alignment with the polarization axis; band_x / band_y: density\n"
-              "  stripes along x (jams across the drive) / along y (1 = random)")
+              "  S: alignment with the current polarization axis (1 = aligned)\n"
+              "  band_x / band_y: density stripes along / across the drive axis (1 = random)\n"
+              "  T_sw: polarization switched by 90 deg every T_sw (static = never)")
 
 
 def run_mips_scan(plan=DEFAULT_PLAN, phis=DEFAULT_PHIS, seeds=(0, 1),
                   out_dir="mips_runs", **kw):
     """Run every (R_T, box, T_total) in ``plan`` at every phi; print a summary."""
     rows = []
-    for R_T, box, T_total in plan:
+    for item in plan:
+        R_T, box, T_total = item[:3]
+        sw = item[3] if len(item) > 3 else None
         for phi in phis:
-            what = ("linear polarization" if kw.get("drive") == "linear"
-                    else f"R_T = {R_T*1e6:.0f} um")
+            if kw.get("drive") == "linear":
+                what = "linear polarization" + (f", switch every {sw:.0f} s" if sw else "")
+            else:
+                what = f"R_T = {R_T*1e6:.0f} um"
             print(f"{what}, phi = {phi:.2f}, box = {box*1e6:.0f} um, T = {T_total:.0f} s")
             rows.append(run_mips_point(R_T, phi, box, T_total, seeds=seeds,
-                                       out_dir=out_dir, **kw))
+                                       out_dir=out_dir, switch_period=sw, **kw))
     print()
     print_table(rows)
 
-    keys = ["R_T_um", "R_T_over_d", "phi", "N", "box_um", "tau_pNnm", "period_s",
+    keys = ["switch_s", "R_T_um", "R_T_over_d", "phi", "N", "box_um", "tau_pNnm", "period_s",
             "T_total_s"] + SUMMARY_KEYS + [k + "_seed_std" for k in SUMMARY_KEYS]
     os.makedirs(out_dir, exist_ok=True)
     np.savetxt(os.path.join(out_dir, "summary.csv"),
@@ -573,11 +678,15 @@ def _parse_args():
                "  python mips_scan.py --quick               # one short test point\n"
                "  python mips_scan.py --rt 44 --phi 0.4 0.6 --box 150 --time 1200\n"
                "  python mips_scan.py --render mips_runs/*.npz   # videos for saved runs\n"
-               "  python mips_scan.py --drive linear --phi 0.2 0.4 0.5 --box 300\n",
+               "  python mips_scan.py --drive linear --phi 0.2 0.4 0.5 --box 300\n"
+               "  python mips_scan.py --drive linear --switch 30 100 300 --phi 0.4 0.6 --box 300\n",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--drive", choices=["circular", "linear"], default="circular",
                    help="circular: chiral disks (uses --rt); linear: FDTD linear-polarization "
                         "drive, disks align to +x/-x (ignores --rt)")
+    p.add_argument("--switch", type=float, nargs="+", metavar="T_SW",
+                   help="linear drive: switch the polarization by 90 deg every T_SW s "
+                        "(several values = several runs); default time max(600, 6 T_SW)")
     p.add_argument("--power", type=float, default=LIN_POWER,
                    help="linear drive: power factor on the FDTD coefficients (default 3)")
     p.add_argument("--quick", action="store_true",
@@ -629,11 +738,19 @@ if __name__ == "__main__":
     extra = {}
     if args.drive == "linear":
         box = (args.box or 300.0) * 1e-6
-        T = args.time or 600.0
-        plan, phis, seeds = [(np.nan, box, T)], args.phi, args.seeds
+        if args.switch:
+            plan = [(np.nan, box,
+                     args.time or float(np.ceil(max(600.0, 6 * sw) / 100) * 100), sw)
+                    for sw in args.switch]
+        else:
+            plan = [(np.nan, box, args.time or 600.0)]
+        phis, seeds = args.phi, args.seeds
         extra = {"drive": "linear", "lin_power": args.power}
         if args.quick:
-            plan, phis, seeds = [(np.nan, 150e-6, 200.0)], [0.4], [0]
+            sw = args.switch[0] if args.switch else None
+            plan, phis, seeds = [(np.nan, 150e-6, 200.0 if not sw else 4 * sw, sw)], [0.4], [0]
+    elif args.switch:
+        raise SystemExit("--switch needs --drive linear")
     elif args.quick:
         plan, phis, seeds = [(44e-6, 150e-6, 300.0)], [0.4], [0]
     elif args.rt is None and args.box is None and args.time is None:
