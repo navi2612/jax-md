@@ -402,6 +402,7 @@ def plot_with_force_curve(
     out_path="metavehicle_force_curve.svg",
     dpi=300,
     show=False,
+    transparent=False,         # drop the white figure background (panels keep panel_bg)
 ):
     """Three-panel poster figure:
         top-left    : optical response vs orientation (linear pol)
@@ -575,7 +576,8 @@ def plot_with_force_curve(
     _circular_glyph(ax_cir, W, cen_cir, handedness, fontsize=15 * fs * epol_scale)
     _radius_annotation(ax_cir, cen_cir, r_T, fontsize=15 * fs)
 
-    fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
+    fig.savefig(out_path, dpi=dpi, bbox_inches="tight",
+                facecolor="none" if transparent else "auto")
     print(f"saved {out_path}")
     if show:
         return fig

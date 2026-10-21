@@ -85,12 +85,21 @@ def _body_geometry(run, body, body_points, body_side, sigma):
 
 def make_video(run, out_path="swarm.mp4", target_frames=240,
                trail_frames=80, fps=24, draw_ghosts=True, title=None,
-               body="auto", body_points=None, body_side=None):
+               body="auto", body_points=None, body_side=None,
+               color_by="index"):
     """Render a time-lapse video of a swarm run.
 
     ``run`` may be the dict returned by ``run``/``run_one``, a run folder, or a
     ``trajectory.npz`` path -- so any old run can be re-rendered without
     re-simulating. See the module docstring for the ``body`` styles.
+
+    ``color_by``:
+      ``"index"``        turbo over particle index (fixed, carries no information)
+      ``"orientation"``  cyclic hsv over the current heading, recoloured every
+                         frame -> polar order, lanes, vortices show as patches;
+                         trails are drawn grey
+      ``"start_angle"``  cyclic hsv over the polar angle of the starting position
+                         around the box centre (fixed) -> shows mixing
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -114,12 +123,23 @@ def make_video(run, out_path="swarm.mp4", target_frames=240,
     A = angles[::skip]
     T = C.shape[0]
 
-    cmap = plt.get_cmap("turbo")
-    face = np.array([cmap(i / max(N - 1, 1)) for i in range(N)])
+    if color_by == "index":
+        cmap = plt.get_cmap("turbo")
+        face = np.array([cmap(i / max(N - 1, 1)) for i in range(N)])
+    elif color_by == "orientation":
+        cmap = plt.get_cmap("hsv")
+        face = cmap(np.mod(A[0], 2 * np.pi) / (2 * np.pi))
+    elif color_by == "start_angle":
+        cmap = plt.get_cmap("hsv")
+        d0 = centers[0] - box / 2
+        face = cmap(np.mod(np.arctan2(d0[:, 1], d0[:, 0]), 2 * np.pi) / (2 * np.pi))
+    else:
+        raise ValueError(f"color_by must be index|orientation|start_angle, got {color_by!r}")
     ghosts = (np.array([[dx, dy] for dx in (-box, 0, box) for dy in (-box, 0, box)])
               if draw_ghosts else np.zeros((1, 2)))
     G = len(ghosts)
     B = 4 if mode == "square" else len(pts)
+    rep = G if mode == "square" else B * G   # face colours per body
     square = 0.5 * (side or sigma) * np.array([[-1, -1], [1, -1], [1, 1], [-1, 1]])
 
     def _rot(f):
@@ -159,8 +179,14 @@ def make_video(run, out_path="swarm.mp4", target_frames=240,
             linewidths=0.4 if B > 1 else 0.7, alpha=0.6, zorder=5)
     ticklc = LineCollection(ticks0, colors="k", linewidths=1.0, zorder=6)
     ax.add_collection(bodies); ax.add_collection(ticklc)
-    trails = [ax.plot([], [], color=face[i], lw=1.0, alpha=0.8, zorder=3)[0]
+    trail_col = ["0.6"] * N if color_by == "orientation" else face
+    trails = [ax.plot([], [], color=trail_col[i], lw=1.0, alpha=0.8, zorder=3)[0]
               for i in range(N)]
+    if color_by != "index":
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, 360))
+        cb = fig.colorbar(sm, ax=ax, fraction=0.046, pad=0.04, ticks=[0, 90, 180, 270, 360])
+        cb.set_label("heading (deg)" if color_by == "orientation"
+                     else "start position angle (deg)")
     ttl = ax.set_title(title or "")
 
     def update(f):
@@ -170,6 +196,9 @@ def make_video(run, out_path="swarm.mp4", target_frames=240,
         else:
             bodies.set_offsets(geom)
         ticklc.set_segments(ticks)
+        if color_by == "orientation":
+            bodies.set_facecolors(np.repeat(
+                cmap(np.mod(A[f], 2 * np.pi) / (2 * np.pi)), rep, axis=0))
         lo = max(0, f - trail_frames)
         for i in range(N):
             tr = C[lo:f + 1, i, :].astype(float).copy()

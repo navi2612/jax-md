@@ -515,7 +515,7 @@ def make_runner(n_particles, sigma=1e-6, area_fraction=0.3, box=None,
         (state, nbrs, ovf), (centers, angles) = lax.scan(outer, carry, light)
         return centers, angles, ovf
 
-    buf = {"extra": 0, "nbrs": nbrs0}          # grown in place, kept across calls
+    buf = {"extra": int(initial_extra_capacity), "nbrs": nbrs0}   # grown in place, kept across calls
 
     def run_one(light, seed=0):
         light = jnp.asarray(light, dtype=jnp.float64)

@@ -164,13 +164,18 @@ def bimodality_coefficient(x):
     return (g**2 + 1) / (k + 3 * (n - 1) ** 2 / ((n - 2) * (n - 3)))
 
 
-def lane_segregation(pos, s, box, half_width, perp_axis=1):
+def lane_segregation(pos, s, box, half_width, perp_axis=1, angle=None):
     """Mean fraction of same-direction particles among those within
-    |d(perp)| < half_width (whole box length along the drive). perp_axis is the
-    coordinate perpendicular to the drive (1 = y for drive along x).
-    0.5 = mixed, 1 = perfect lanes."""
-    dy = pos[:, perp_axis][:, None] - pos[:, perp_axis][None, :]
-    dy -= box * np.round(dy / box)
+    |d(perp)| < half_width (whole box along the drive). The drive axis is
+    given either by perp_axis (1 = y-coordinate is perpendicular, i.e. drive
+    along x) or by an arbitrary drive angle in rad. 0.5 = mixed, 1 = lanes."""
+    if angle is None:
+        dy = pos[:, perp_axis][:, None] - pos[:, perp_axis][None, :]
+        dy -= box * np.round(dy / box)
+    else:
+        dxy = pos[:, None, :] - pos[None, :, :]
+        dxy -= box * np.round(dxy / box)
+        dy = -dxy[..., 0] * np.sin(angle) + dxy[..., 1] * np.cos(angle)
     m = np.abs(dy) < half_width
     np.fill_diagonal(m, False)
     n = m.sum(1)
@@ -226,12 +231,31 @@ def analyze_run(centers, box, t_sample, v0, diameter=DIAMETER,
         v_par = (d * e[1:, None, :]).sum(-1) / t_sample            # velocity along the axis
         mob_t = np.r_[np.nan, (s[1:] * v_par).mean(1) / v0]        # along own direction
         S_t = np.cos(2 * rel).mean(1)                              # +1 aligned, -1 perpendicular
-        ax_drive = np.where(np.cos(2 * pol_f) > 0, 0, 1)           # 0: axis = x, 1: axis = y
+        ax_drive = np.where(np.cos(2 * pol_f) > 0, 0, 1)           # nearest lattice axis
+        on_axis = np.all(np.isclose(np.mod(pol_f, np.pi / 2), 0) |
+                         np.isclose(np.mod(pol_f, np.pi / 2), np.pi / 2))
         frames = (np.arange(T) if switching else sel[:: max(1, len(sel) // 100)])
+        if switching and not on_axis:                              # rotating: thin out
+            frames = frames[:: max(1, len(frames) // 400)]
         lane_t = np.full(T, np.nan)
         for k in frames:
-            lane_t[k] = lane_segregation(np.mod(centers[k], box), s[k], box,
-                                         0.5 * diameter, perp_axis=1 - ax_drive[k])
+            if on_axis:
+                lane_t[k] = lane_segregation(np.mod(centers[k], box), s[k], box,
+                                             0.5 * diameter, perp_axis=1 - ax_drive[k])
+            else:
+                lane_t[k] = lane_segregation(np.mod(centers[k], box), s[k], box,
+                                             0.5 * diameter, angle=pol_f[k])
+        # locking: lag alpha = pol - theta (nematic, in (-90, 90] deg), phase slips
+        alpha = np.mod(-rel + np.pi / 2, np.pi) - np.pi / 2            # pol - theta
+        a2 = np.unwrap(2 * (pol_f[:, None] - angles), axis=0) / 2  # continuous lag
+        slips = (a2[sel[-1]] - a2[sel[0]]) / np.pi                  # per particle
+        th = np.unwrap(angles, axis=0)
+        dt_sel = max(t[sel[-1]] - t[sel[0]], 1e-12)
+        out_dir_obs["lab_rot_rate"] = float(np.mean((th[sel[-1]] - th[sel[0]]) / dt_sel))
+        out_dir_obs["locked_frac"] = float(np.mean(np.abs(slips) < 0.5))
+        out_dir_obs["slips_per_min"] = float(np.mean(np.abs(slips)) / dt_sel * 60)
+        out_dir_obs["lag_mean_deg"] = float(np.degrees(np.mean(alpha[sel])))
+        out_dir_obs["alpha_sel"] = alpha[sel[:: max(1, len(sel) // 200)]].ravel()
         sub = sel[:: max(1, len(sel) // 100)]
         nb = max(int(box // (cell_factor * diameter)), 1)
         out_dir_obs["drive_mob"] = float(np.nanmean(mob_t[sel]))
@@ -261,7 +285,32 @@ def analyze_run(centers, box, t_sample, v0, diameter=DIAMETER,
 
 SUMMARY_KEYS = ["lcf_mean", "lcf_std", "lcf_max", "phi_loc_std",
                 "bimodality", "speed_rel", "blocked_frac",
-                "drive_mob", "nematic_S", "lane_seg", "band_x", "band_y"]
+                "drive_mob", "nematic_S", "lane_seg", "band_x", "band_y",
+                "lab_rot_rate", "locked_frac", "slips_per_min", "lag_mean_deg"]
+
+
+def locking_theory(omega, k):
+    """Adler equation d(alpha)/dt = omega - k sin(2 alpha) for a polarization
+    axis rotating at omega [rad/s] and aligning rate k [1/s].
+    Returns dict: locked, lag alpha* [rad], slip period [s], mean lab
+    rotation rate of the particle [rad/s]."""
+    omega, k = float(omega), float(k)
+    if abs(omega) < k:
+        return {"locked": True, "lag": 0.5 * np.arcsin(omega / k),
+                "slip_period": np.inf, "mean_rate": omega}
+    root = np.sqrt(omega**2 - k**2)
+    return {"locked": False, "lag": np.nan, "slip_period": np.pi / root,
+            "mean_rate": omega - np.sign(omega) * root}
+
+
+def lin_align_rate(TZ=LIN_TZ, power=LIN_POWER, gamma_r=8000e-21):
+    """k in tau = k gamma_r sin(2 alpha) for the linear design (TZ[2] = C of C sin cos)."""
+    return TZ[2] * 1e-21 * power / 2 / gamma_r
+
+
+def lin_speed(alpha, FX=LIN_FX, power=LIN_POWER, gamma_t=470e-9):
+    """Propulsion speed at lag alpha (A cos^2 + B sin^2)."""
+    return (FX[0] * np.cos(alpha)**2 + FX[1] * np.sin(alpha)**2) * 1e-12 * power / gamma_t
 
 
 # =============================================================================
@@ -335,7 +384,7 @@ def render_run(npz_path, out_path=None, fps=20, max_frames=600, diameter=DIAMETE
         disks.set_facecolors(col)
         tip = p + 0.5 * d * np.c_[np.cos(angles[k]), np.sin(angles[k])]
         heads.set_segments(np.stack([p, tip], 1))
-        polstr = f",  polarization {np.degrees(pol[k]):.0f}°" if switching else ""
+        polstr = (f",  polarization {np.degrees(pol[k]) % 180:.0f}°" if switching else "")
         title.set_text(f"{params}\nt = {k*t_sample:.0f} s{polstr},  largest cluster = "
                        f"{size.max()/N:.2f}")
         return disks, heads, title
@@ -390,7 +439,28 @@ def plot_run_summary(npz_path, out_path=None, diameter=DIAMETER, cell_factor=3.0
     ax[1].set_title("one peak: homogeneous   two peaks: phase separation")
     pol = z["pol"] if "pol" in z.files else np.zeros(len(t))
     switching = linear and np.ptp(pol) > 0
-    if switching:
+    rotating = switching and "rotate_dps" in z.files and np.isfinite(float(z["rotate_dps"]))
+    if rotating:
+        S_t, lane_t, mob_t = z["S_t"], z["lane_t"], z["mob_t"]
+        a = axs[1, 0]
+        a.plot(t, S_t, lw=1, label="alignment with current axis")
+        ok = np.isfinite(lane_t)
+        a.plot(t[ok], lane_t[ok], lw=1, label="lanes along current axis")
+        a.plot(t, mob_t, lw=1, label="flow along own direction / v₀")
+        a.set_ylim(-1.05, 1.05); a.set_xlabel("time (s)"); a.legend(fontsize=8, loc="lower left")
+        a.set_title("order parameters vs time")
+        b = axs[1, 1]
+        al = np.degrees(z["alpha_sel"])
+        b.hist(al, bins=np.linspace(-90, 90, 37), density=True, color="C2")
+        k_al = float(z["k_align"]); om = np.radians(float(z["rotate_dps"]))
+        th_ = locking_theory(om, k_al)
+        if th_["locked"]:
+            b.axvline(np.degrees(th_["lag"]), color="k", ls="--", lw=1, label="predicted lag")
+            b.legend(fontsize=8)
+        b.set_xlabel("lag polarization − particle (deg)"); b.set_ylabel("probability density")
+        b.set_title(("locked" if th_["locked"] else "unlocked") +
+                    f" (threshold {np.degrees(k_al):.2f}°/s)")
+    elif switching:
         T_sw = float(z["switch_s"])
         for m in np.arange(T_sw, t[-1], T_sw):
             ax[0].axvline(m, color="0.6", lw=0.6, ls=":")
@@ -475,9 +545,25 @@ def polarization_schedule(n_samples, t_sample, switch_period):
     return (np.pi / 2) * (np.floor(k * t_sample / switch_period) % 2)
 
 
+def rotation_schedule(n_samples, t_sample, rate_deg_s, step_deg=None):
+    """Polarization angle per sample for a rotation at rate_deg_s. The angle is
+    held for one sample, so it advances in steps of rate*t_sample; with
+    step_deg it advances in larger steps of step_deg every step_deg/rate s."""
+    t = np.arange(n_samples) * t_sample
+    ang = rate_deg_s * t
+    if step_deg:
+        ang = step_deg * np.floor(ang / step_deg + 1e-9)
+    return np.radians(ang)
+
+
 def _run_label(z):
     if "drive" in z.files and str(z["drive"]) == "linear":
         sw = float(z["switch_s"]) if "switch_s" in z.files else np.nan
+        rot = float(z["rotate_dps"]) if "rotate_dps" in z.files else np.nan
+        if np.isfinite(rot):
+            st = float(z["rotate_step_deg"]) if "rotate_step_deg" in z.files else np.nan
+            return (f"linear, rotating {rot:g}°/s"
+                    + (f" in {st:g}° steps" if np.isfinite(st) else ""))
         return ("linear polarization" if not np.isfinite(sw)
                 else f"linear, switched by 90° every {sw:.0f} s")
     return f"$R_T$ = {float(z['R_T'])*1e6:.0f} µm"
@@ -492,7 +578,8 @@ def run_mips_point(R_T, phi, box, T_total, seeds=(0, 1), t_sample=1.0, dt=5e-4,
                    out_dir="mips_runs", verbose=True, video=True, summary_plot=True,
                    video_max_frames=600, initial_extra_capacity=16,
                    drive="circular", lin_coeffs=(LIN_FX, LIN_FY, LIN_TZ),
-                   lin_power=LIN_POWER, switch_period=None):
+                   lin_power=LIN_POWER, switch_period=None, rotate_dps=None,
+                   rotate_step_deg=None):
     """Simulate one (R_T, phi) point for several seeds and return the observables.
 
     Returns a dict with the parameters, seed-averaged observables (``*_mean``
@@ -514,7 +601,25 @@ def run_mips_point(R_T, phi, box, T_total, seeds=(0, 1), t_sample=1.0, dt=5e-4,
     pol = None
     if drive == "linear":
         FX, FY, TZ = lin_coeffs
-        if switch_period:
+        if rotate_dps:
+            drive_fn = make_switching_drive(FX, FY, TZ, power=lin_power)
+            pol = rotation_schedule(n_samples, t_sample, rotate_dps, rotate_step_deg)
+            u = pol.copy()
+            k_al = TZ[2] * 1e-21 * lin_power / 2 / rb[2, 2]
+            th_ = locking_theory(np.radians(rotate_dps), k_al)
+            if verbose:
+                lag = th_["lag"] if th_["locked"] else np.pi / 4
+                R = lin_speed(lag, FX, lin_power, rb[0, 0]) / abs(th_["mean_rate"])
+                print(f"  rotating {rotate_dps:g} deg/s; locking threshold k = "
+                      f"{np.degrees(k_al):.2f} deg/s -> "
+                      + (f"LOCKED, lag {np.degrees(th_['lag']):.1f} deg, circle R ~ {R*1e6:.0f} um"
+                         if th_["locked"] else
+                         f"UNLOCKED, slip every {th_['slip_period']:.1f} s, mean particle "
+                         f"rotation {np.degrees(th_['mean_rate']):.2f} deg/s, R_eff ~ {R*1e6:.0f} um"))
+            step = rotate_step_deg or rotate_dps * t_sample
+            if step > 30:
+                print(f"  WARNING: {step:.0f} deg per update is coarse; use a smaller --sample")
+        elif switch_period:
             # the light channel carries the polarization angle instead of intensity
             drive_fn = make_switching_drive(FX, FY, TZ, power=lin_power)
             pol = polarization_schedule(n_samples, t_sample, switch_period)
@@ -570,7 +675,9 @@ def run_mips_point(R_T, phi, box, T_total, seeds=(0, 1), t_sample=1.0, dt=5e-4,
         res["wall_s"] = time.time() - t0
         per_seed.append(res)
         head = ("RT%.0f" % (R_T * 1e6) if drive != "linear"
-                else ("LIN_sw%.0f" % switch_period if switch_period else "LIN"))
+                else ("LIN_rot%g" % rotate_dps + ("_st%g" % rotate_step_deg if rotate_step_deg else "")
+                      if rotate_dps else
+                      "LIN_sw%.0f" % switch_period if switch_period else "LIN"))
         tag = f"{head}_phi{phi:.2f}_box{box*1e6:.0f}_s{seed}"
         npz = os.path.join(out_dir, tag + ".npz")
         np.savez_compressed(npz, centers=centers, angles=angles, box=box,
@@ -578,11 +685,20 @@ def run_mips_point(R_T, phi, box, T_total, seeds=(0, 1), t_sample=1.0, dt=5e-4,
                             tau=tau, F=F, v0=v0, omega=omega, lcf_t=res["lcf_t"],
                             drive=drive,
                             switch_s=switch_period if switch_period else np.nan,
+                            rotate_dps=rotate_dps if rotate_dps else np.nan,
+                            rotate_step_deg=rotate_step_deg if rotate_step_deg else np.nan,
+                            k_align=(lin_coeffs[2][2] * 1e-21 * lin_power / 2 / rb[2, 2]
+                                     if drive == "linear" else np.nan),
+                            alpha_sel=res.get("alpha_sel", np.zeros(0)),
                             **({"pol": pol, "mob_t": res["mob_t"], "S_t": res["S_t"],
                                 "lane_t": res["lane_t"]} if pol is not None else {}))
         if verbose:
             extra = (f"  drive_mob={res['drive_mob']:.2f}  lanes={res['lane_seg']:.2f}"
                      if drive == "linear" else "")
+            if rotate_dps:
+                extra += (f"  locked={res['locked_frac']:.2f}  particle rotation "
+                          f"{np.degrees(res['lab_rot_rate']):.2f} deg/s (theory "
+                          f"{np.degrees(th_['mean_rate']):.2f})")
             print(f"    seed {seed}: lcf={res['lcf_mean']:.2f}  "
                   f"bimod={res['bimodality']:.2f}  speed={res['speed_rel']:.2f}"
                   f"{extra}  ({res['wall_s']:.0f} s)")
@@ -595,6 +711,7 @@ def run_mips_point(R_T, phi, box, T_total, seeds=(0, 1), t_sample=1.0, dt=5e-4,
                 print(f"    video -> {path} ({time.time() - t1:.0f} s)")
 
     out = {"drive": drive, "switch_s": switch_period if switch_period else np.nan,
+           "rotate_dps": rotate_dps if rotate_dps else np.nan,
            "R_T_um": R_T * 1e6, "R_T_over_d": R_T / diameter, "phi": phi_real,
            "N": N, "box_um": box * 1e6, "tau_pNnm": tau * 1e21,
            "period_s": period, "T_total_s": T_total, "per_seed": per_seed}
@@ -603,6 +720,56 @@ def run_mips_point(R_T, phi, box, T_total, seeds=(0, 1), t_sample=1.0, dt=5e-4,
         out[k] = float(np.nanmean(vals))
         out[k + "_seed_std"] = float(np.nanstd(vals))
     return out
+
+
+def locking_check(rates_deg_s=(1, 2, 2.5, 3, 5, 10), T_total=600.0, t_sample=0.2,
+                  dt=5e-4, lin_coeffs=(LIN_FX, LIN_FY, LIN_TZ), lin_power=LIN_POWER,
+                  diameter=DIAMETER):
+    """Single-particle test of the locking transition with your real integrator:
+    two disks far apart, polarization rotating at each rate; prints measured vs
+    predicted mean particle rotation rate and lag."""
+    import importlib
+    import jax.numpy as jnp
+    from jax import random
+    from jax_md import rigid_body
+    sim = importlib.import_module(SIM_MODULE)
+    from trajectory import DEFAULT_RESISTANCE_BODY, KT_300K
+    rb = np.asarray(DEFAULT_RESISTANCE_BODY)
+    FX, FY, TZ = lin_coeffs
+    k_al = TZ[2] * 1e-21 * lin_power / 2 / rb[2, 2]
+    box = 2e-3
+
+    def init(n, box_, seed):
+        pos = np.array([[0.5e-3, 1e-3], [1.5e-3, 1e-3]])[:n]
+        return rigid_body.RigidBody(jnp.asarray(pos), jnp.zeros(n)), random.PRNGKey(seed)
+
+    n_samples = int(round(T_total / t_sample))
+    print(f"locking threshold k = {np.degrees(k_al):.2f} deg/s "
+          f"(alignment time 1/(2k) = {1/(2*k_al):.1f} s)")
+    print(f"{'rate':>6} | {'theory':>22} | {'measured rotation':>17} {'theory':>8} | "
+          f"{'lag meas.':>9} {'theory':>7}")
+    import inspect
+    for rate in rates_deg_s:
+        kw = dict(n_particles=2, sigma=diameter, box=box, shape=sim.single_bead_shape(),
+                  drive_fn=make_switching_drive(FX, FY, TZ, power=lin_power), init=init,
+                  epsilon=5e-17 * (diameter / 1e-6) ** 2, dt=dt,
+                  steps_per_sample=int(round(t_sample / dt)), kT=KT_300K,
+                  resistance_body=rb, capacity_multiplier=4.0, progress=False)
+        if "initial_extra_capacity" in inspect.signature(sim.make_runner).parameters:
+            kw["initial_extra_capacity"] = 4
+        runner = sim.make_runner(**kw)
+        pol = rotation_schedule(n_samples, t_sample, rate)
+        _, angles, _ = runner(pol, seed=0)
+        th = locking_theory(np.radians(rate), k_al)
+        half = n_samples // 2
+        tt = np.arange(n_samples) * t_sample
+        rot = np.mean((np.unwrap(angles[:, 0])[-1] - np.unwrap(angles[:, 0])[half])
+                      / (tt[-1] - tt[half]))
+        lag = np.degrees(np.mean(np.mod(pol[half:] - angles[half:, 0] + np.pi / 2, np.pi)
+                                 - np.pi / 2))
+        lab = ("locked" if th["locked"] else f"unlocked, slip {th['slip_period']:.0f} s")
+        print(f"{rate:6g} | {lab:>22} | {np.degrees(rot):12.2f} deg/s {np.degrees(th['mean_rate']):8.2f} | "
+              f"{lag:9.1f} {np.degrees(th['lag']) if th['locked'] else float('nan'):7.1f}")
 
 
 def print_table(rows):
@@ -621,22 +788,26 @@ def print_table(rows):
     if lin:
         if circ:
             print()
-        head = (f"{'T_sw':>6}  {'phi':>5} {'N':>5} | {'drive_mob':>9} {'lanes':>5} "
+        head = (f"{'drive':>7}  {'phi':>5} {'N':>5} | {'drive_mob':>9} {'lanes':>5} "
                 f"{'S':>5} {'band_x':>6} {'band_y':>6} | {'lcf':>5} {'bimod':>6} "
-                f"{'sd_phi':>6} {'blocked':>7}")
+                f"{'sd_phi':>6} {'blocked':>7} | {'locked':>6}")
         print(head); print("-" * len(head))
         for r in lin:
             sw = r.get("switch_s", np.nan)
-            swtxt = "static" if not np.isfinite(sw) else f"{sw:.0f} s"
-            print(f"{swtxt:>6}  {r['phi']:5.2f} {r['N']:5d} | {r['drive_mob']:9.2f} "
+            rot = r.get("rotate_dps", np.nan)
+            swtxt = (f"{rot:g}°/s" if np.isfinite(rot) else
+                     "static" if not np.isfinite(sw) else f"{sw:.0f} s")
+            lk = f"{r['locked_frac']:6.2f}" if np.isfinite(rot) else f"{'-':>6}"
+            print(f"{swtxt:>7}  {r['phi']:5.2f} {r['N']:5d} | {r['drive_mob']:9.2f} "
                   f"{r['lane_seg']:5.2f} {r['nematic_S']:5.2f} {r['band_x']:6.2f} "
                   f"{r['band_y']:6.2f} | {r['lcf_mean']:5.2f} {r['bimodality']:6.2f} "
-                  f"{r['phi_loc_std']:6.2f} {r['blocked_frac']:7.2f}")
+                  f"{r['phi_loc_std']:6.2f} {r['blocked_frac']:7.2f} | {lk}")
         print("  drive_mob: speed along own direction / v0 (1 = free flow, ~0 = jammed)\n"
               "  lanes: same-direction share of y-neighbours (0.5 = mixed, 1 = lanes)\n"
               "  S: alignment with the current polarization axis (1 = aligned)\n"
               "  band_x / band_y: density stripes along / across the drive axis (1 = random)\n"
-              "  T_sw: polarization switched by 90 deg every T_sw (static = never)")
+              "  drive: static / switched every T_sw / rotating at deg/s\n"
+              "  locked: fraction of particles following the rotating axis (no phase slips)")
 
 
 def run_mips_scan(plan=DEFAULT_PLAN, phis=DEFAULT_PHIS, seeds=(0, 1),
@@ -646,18 +817,22 @@ def run_mips_scan(plan=DEFAULT_PLAN, phis=DEFAULT_PHIS, seeds=(0, 1),
     for item in plan:
         R_T, box, T_total = item[:3]
         sw = item[3] if len(item) > 3 else None
+        rot = item[4] if len(item) > 4 else None
+        rstep = item[5] if len(item) > 5 else None
         for phi in phis:
             if kw.get("drive") == "linear":
-                what = "linear polarization" + (f", switch every {sw:.0f} s" if sw else "")
+                what = "linear polarization" + (f", switch every {sw:.0f} s" if sw else
+                                                f", rotating {rot:g} deg/s" if rot else "")
             else:
                 what = f"R_T = {R_T*1e6:.0f} um"
             print(f"{what}, phi = {phi:.2f}, box = {box*1e6:.0f} um, T = {T_total:.0f} s")
             rows.append(run_mips_point(R_T, phi, box, T_total, seeds=seeds,
-                                       out_dir=out_dir, switch_period=sw, **kw))
+                                       out_dir=out_dir, switch_period=sw,
+                                       rotate_dps=rot, rotate_step_deg=rstep, **kw))
     print()
     print_table(rows)
 
-    keys = ["switch_s", "R_T_um", "R_T_over_d", "phi", "N", "box_um", "tau_pNnm", "period_s",
+    keys = ["switch_s", "rotate_dps", "R_T_um", "R_T_over_d", "phi", "N", "box_um", "tau_pNnm", "period_s",
             "T_total_s"] + SUMMARY_KEYS + [k + "_seed_std" for k in SUMMARY_KEYS]
     os.makedirs(out_dir, exist_ok=True)
     np.savetxt(os.path.join(out_dir, "summary.csv"),
@@ -679,7 +854,9 @@ def _parse_args():
                "  python mips_scan.py --rt 44 --phi 0.4 0.6 --box 150 --time 1200\n"
                "  python mips_scan.py --render mips_runs/*.npz   # videos for saved runs\n"
                "  python mips_scan.py --drive linear --phi 0.2 0.4 0.5 --box 300\n"
-               "  python mips_scan.py --drive linear --switch 30 100 300 --phi 0.4 0.6 --box 300\n",
+               "  python mips_scan.py --drive linear --switch 30 100 300 --phi 0.4 0.6 --box 300\n"
+               "  python mips_scan.py --locking-check\n"
+               "  python mips_scan.py --drive linear --rotate 1 5 10 --phi 0.5 --box 400\n",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--drive", choices=["circular", "linear"], default="circular",
                    help="circular: chiral disks (uses --rt); linear: FDTD linear-polarization "
@@ -687,6 +864,15 @@ def _parse_args():
     p.add_argument("--switch", type=float, nargs="+", metavar="T_SW",
                    help="linear drive: switch the polarization by 90 deg every T_SW s "
                         "(several values = several runs); default time max(600, 6 T_SW)")
+    p.add_argument("--rotate", type=float, nargs="+", metavar="DEG_PER_S",
+                   help="linear drive: rotate the polarization at DEG_PER_S (several values "
+                        "= several runs); default time max(600, 2 particle turns)")
+    p.add_argument("--step", type=float, default=None, metavar="DEG",
+                   help="with --rotate: advance in steps of DEG (default: every --sample)")
+    p.add_argument("--sample", type=float, default=1.0,
+                   help="time between saved frames / light updates in s (default 1)")
+    p.add_argument("--locking-check", action="store_true",
+                   help="single-particle test of the locking transition, then exit")
     p.add_argument("--power", type=float, default=LIN_POWER,
                    help="linear drive: power factor on the FDTD coefficients (default 3)")
     p.add_argument("--quick", action="store_true",
@@ -730,6 +916,9 @@ if __name__ == "__main__":
     if args.module:
         SIM_MODULE = args.module
 
+    if args.locking_check:
+        locking_check()
+        raise SystemExit
     if args.render:
         for f in args.render:
             print(f"{f}: {plot_run_summary(f)}, {render_run(f)}")
@@ -738,7 +927,16 @@ if __name__ == "__main__":
     extra = {}
     if args.drive == "linear":
         box = (args.box or 300.0) * 1e-6
-        if args.switch:
+        if args.switch and args.rotate:
+            raise SystemExit("use either --switch or --rotate")
+        if args.rotate:
+            k_al = lin_align_rate(power=args.power)
+            plan = []
+            for r in args.rotate:
+                mr = abs(locking_theory(np.radians(r), k_al)["mean_rate"])
+                T = args.time or float(np.ceil(max(600.0, 2 * 2 * np.pi / mr) / 100) * 100)
+                plan.append((np.nan, box, T, None, r, args.step))
+        elif args.switch:
             plan = [(np.nan, box,
                      args.time or float(np.ceil(max(600.0, 6 * sw) / 100) * 100), sw)
                     for sw in args.switch]
@@ -749,8 +947,8 @@ if __name__ == "__main__":
         if args.quick:
             sw = args.switch[0] if args.switch else None
             plan, phis, seeds = [(np.nan, 150e-6, 200.0 if not sw else 4 * sw, sw)], [0.4], [0]
-    elif args.switch:
-        raise SystemExit("--switch needs --drive linear")
+    elif args.switch or args.rotate:
+        raise SystemExit("--switch / --rotate need --drive linear")
     elif args.quick:
         plan, phis, seeds = [(44e-6, 150e-6, 300.0)], [0.4], [0]
     elif args.rt is None and args.box is None and args.time is None:
@@ -763,5 +961,6 @@ if __name__ == "__main__":
 
     t0 = time.time()
     run_mips_scan(plan=plan, phis=phis, seeds=tuple(seeds), out_dir=args.out, dt=args.dt,
-                  video=not args.no_video, capacity_multiplier=args.capacity, **extra)
+                  video=not args.no_video, capacity_multiplier=args.capacity,
+                  t_sample=args.sample, **extra)
     print(f"\ntotal wall time {time.time() - t0:.0f} s; results in {args.out}/")
