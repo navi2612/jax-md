@@ -24,8 +24,10 @@ committed). So ``save_run`` also records whether tracked files were dirty and
 the git status of the script that produced the run; pass ``source=__file__``.
 """
 
+import hashlib
 import json
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -101,6 +103,43 @@ def run_dir_name(label=None, prefix="run", stamp=None):
     return "_".join(str(p) for p in parts)
 
 
+# Code as it was when this process started. Snapshotting at import time (and
+# not when a run is saved) matters: a script edited while a long run is still
+# going would otherwise be recorded with code the run never executed.
+_CODE_DIR = Path(__file__).resolve().parent
+_CODE_SNAPSHOT = {}
+for _p in sorted(_CODE_DIR.glob("*.py")):
+    try:
+        _CODE_SNAPSHOT[_p.name] = _p.read_bytes()
+    except OSError:
+        pass
+
+
+def _save_code(run_dir, source=None):
+    """Copy the start-of-process code of every optical_sim module this process
+    imported (plus ``source``) into ``run_dir/code``; return name -> sha256."""
+    names = set()
+    for mod in list(sys.modules.values()):
+        f = getattr(mod, "__file__", None)
+        if f and Path(f).resolve().parent == _CODE_DIR:
+            names.add(Path(f).name)
+    if source is not None:
+        names.add(Path(source).name)
+    code_dir = Path(run_dir) / "code"
+    code_dir.mkdir(exist_ok=True)
+    digests = {}
+    for n in sorted(names):
+        blob = _CODE_SNAPSHOT.get(n)
+        if blob is None:                       # created after start: best effort
+            try:
+                blob = (_CODE_DIR / n).read_bytes()
+            except OSError:
+                continue
+        (code_dir / n).write_bytes(blob)
+        digests[n] = hashlib.sha256(blob).hexdigest()[:16]
+    return digests
+
+
 def save_run(arrays, meta=None, label=None, results_dir=RESULTS_DIR,
              prefix="run", plot_fn=None, source=None):
     """Write one run folder and return its ``Path``.
@@ -109,6 +148,10 @@ def save_run(arrays, meta=None, label=None, results_dir=RESULTS_DIR,
     ``meta``     dict of parameters; provenance fields are added, not replaced.
     ``plot_fn``  optional ``plot_fn(run_dir)`` for a snapshot figure.
     ``source``   pass ``__file__`` so the script's own git status is recorded.
+
+    The code of every ``optical_sim`` module the process imported is copied
+    into ``code/`` as it was at process start, so a run stays reproducible
+    even when the scripts are uncommitted or edited while it runs.
 
     If the target folder exists, ``-1``, ``-2``, ... is appended rather than
     overwriting -- runs are never silently clobbered.
@@ -126,6 +169,7 @@ def save_run(arrays, meta=None, label=None, results_dir=RESULTS_DIR,
 
     meta = dict(meta or {})
     meta.update(provenance(source))
+    meta["code_sha256"] = _save_code(run_dir, source)
     with open(run_dir / "metadata.json", "w") as f:
         json.dump(meta, f, indent=2, default=json_default)
 
