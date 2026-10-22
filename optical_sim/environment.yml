@@ -1,0 +1,25 @@
+# Minimal environment for optical_sim (swarm / arena / collective) -- not the
+# full pmeep env (no meep). Versions are those used on the Mac (2026-10-22).
+#
+#   conda env create -f optical_sim/environment.yml
+#   conda activate optsim
+#   pip install -e .                    # the jax-md fork, from the repo root
+#
+# NVIDIA GPU (Linux or WSL2 only; JAX has no native Windows CUDA build).
+# RTX 50xx (Blackwell) needs CUDA >= 12.8, which the pip wheels bring along:
+#   pip install -U "jax[cuda12]==0.9.2"
+#   python -c "import jax; print(jax.devices())"      # must list a CudaDevice
+name: optsim
+channels:
+  - conda-forge
+dependencies:
+  - python=3.13
+  - numpy=2.3
+  - scipy=1.16
+  - matplotlib=3.10
+  - tqdm
+  - ffmpeg            # mp4 videos; without it make_movie falls back to GIF
+  - pip
+  - pip:
+      - jax==0.9.2
+      - jaxlib==0.9.2

@@ -3,8 +3,11 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
+import os
 import jax
-jax.config.update("jax_enable_x64", True)
+# float64 by default; OPTSIM_X64=0 runs in float32 (fast on consumer GPUs,
+# whose float64 rate is ~1/64 of float32 -- validate before trusting it)
+jax.config.update("jax_enable_x64", os.environ.get("OPTSIM_X64", "1") != "0")
 
 import numpy as np
 import jax.numpy as jnp
