@@ -107,7 +107,7 @@ def main():
     print(f"per run   {np.mean(sps):8.0f} steps/s  -> "
           f"{1000 / dt / np.mean(sps) / 3600:.2f} h per Phase-2 run")
     print(f"total     {np.sum(sps):8.0f} steps/s  -> "
-          f"{np.sum(sps) / (1000 / dt) * 24:.1f} Phase-2 runs per day")
+          f"{np.sum(sps) / (1000 / dt) * 86400:.1f} Phase-2 runs per day")
 
 
 if __name__ == "__main__":

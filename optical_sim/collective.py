@@ -34,6 +34,7 @@ from dataclasses import dataclass, asdict, field
 from pathlib import Path
 
 import numpy as np
+import jax
 import jax.numpy as jnp
 from jax import random
 from jax_md import energy, partition, quantity, rigid_body
@@ -340,7 +341,8 @@ def simulate(types, label, *, r_arena=None, L=None, T_total, t_sample=1.0, dt=4e
             "r_arena_m": r_arena, "L_m": L, "periodic": periodic,
             "center_m": list(center), "interacting": interacting,
             "types": [asdict(t) | {"R_T_m": t.R_T} for t in types],
-            "area_m2": AREA, "v0_m_s": V0, "tag": tag}
+            "area_m2": AREA, "v0_m_s": V0, "tag": tag,
+            "x64": bool(jax.config.read("jax_enable_x64"))}
     run_dir = save_run(
         arrays={"centers": centers, "angles": angles, "species": species,
                 "light": u, "box": box, "sigma": SIGMA,
@@ -536,6 +538,167 @@ def wall_split(run_dir, t_from=0.5, stride_s=10.0):
     w, bulk, inner = np.mean(rows, axis=0)
     return {"wall_attached": float(w), "bulk_largest": float(bulk),
             "interior": float(inner)}
+
+
+# --------------------------------------------------------------------------
+# walled arena, Phase 3: vortex / swarm / phase separation (Lei et al.,
+# Soft Matter 19, 1312 (2023)), time series, convergence
+# --------------------------------------------------------------------------
+def _arena_frame(c, v, th, cen, R):
+    """Dynamic order parameters of one frame. v: velocities [m/s]."""
+    rel = c - cen
+    r = np.maximum(np.linalg.norm(rel, axis=1), 1e-12)
+    vphi = (v[:, 1] * rel[:, 0] - v[:, 0] * rel[:, 1]) / r      # azimuthal, + = ccw
+    sp = np.linalg.norm(v, axis=1)
+    s = max(sp.sum(), 1e-30)
+    return dict(
+        # vortex order (Lei eq. 6): 1 = all motion azimuthal, 0 = random, <0 radial
+        chi=(np.abs(vphi).sum() / s - 2 / np.pi) / (1 - 2 / np.pi),
+        spin=float(np.mean(np.sign(vphi))),          # Lei eq. 7: +1 ccw, -1 cw
+        omega=vphi.mean() / V0,                      # signed circulation / v0
+        vpolar=np.linalg.norm(v.sum(0)) / s,         # swarm: common direction of motion
+        polar=np.abs(np.exp(1j * th).mean()),        # common heading
+        speed=sp.mean() / V0,
+        near_wall=float(np.mean(r > R - 2 * SIDE)))
+
+
+def _bimodality(x):
+    """Sarle's bimodality coefficient; > 5/9 (uniform) hints at two peaks."""
+    x = np.asarray(x, float)
+    if len(x) < 4 or x.std() == 0:
+        return 0.0
+    z = (x - x.mean()) / x.std()
+    return float(((z ** 3).mean() ** 2 + 1) / (z ** 4).mean())
+
+
+def metrics_arena(run_dir, t_from=0.5, t_to=1.0, stride_s=2.0, corr_every=10,
+                  r_bin=10e-6):
+    """Observables over [t_from, t_to) of a walled-arena run.
+
+    chi, spin, omega, vpolar, polar, speed, near_wall: see ``_arena_frame``.
+    largest, csize, dens_std: as in ``metrics``. local_align: <cos dtheta>, pairs
+    < 25 um. bimodality / phi_hist: distribution of the local area fraction of
+    particles in cells fully inside the arena (two peaks = phase separation).
+    corr_rmin, corr_min: position and depth of the minimum of the velocity
+    correlation C(r) = <v_i.v_j>/<v^2> (a negative minimum = vortex of that
+    size)."""
+    C, A, sp, beads, meta = load(run_dir)
+    ts, R = meta["t_sample"], meta["r_arena_m"]
+    cen = np.asarray(meta["center_m"])
+    k = max(1, int(round(stride_s / ts)))
+    st = _Static(sp, beads, cen, R)
+    edges = np.r_[st.g, st.g[-1] + st.cell]
+    nb = int(np.ceil(2 * R / r_bin))
+    num, cnt, v2 = np.zeros(nb), np.zeros(nb), []
+    rows, phis = [], []
+    frames = range(int(t_from * len(C)), int(t_to * len(C)) - k, k)
+    for j, f in enumerate(frames):
+        c, th = C[f], A[f]
+        v = (C[f + k] - c) / (k * ts)
+        row = _arena_frame(c, v, th, cen, R)
+        row["largest"], row["csize"], row["dens_std"] = st.frame(c, th)
+        pp = cKDTree(c).query_pairs(2.5 * SIDE, output_type="ndarray")
+        row["local_align"] = (np.cos(th[pp[:, 0]] - th[pp[:, 1]]).mean()
+                              if len(pp) else 0.0)
+        rows.append(row)
+        h, _, _ = np.histogram2d(c[:, 0], c[:, 1], bins=[edges, edges])
+        ix = np.clip(np.searchsorted(edges, c[:, 0]) - 1, 0, len(st.g) - 1)
+        iy = np.clip(np.searchsorted(edges, c[:, 1]) - 1, 0, len(st.g) - 1)
+        inside = st.ok[iy, ix]
+        phis.append((h[ix, iy] * AREA / st.cell ** 2)[inside])
+        if j % corr_every == 0:
+            iu = np.triu_indices(len(c), 1)
+            d = np.linalg.norm(c[:, None] - c[None], axis=-1)[iu]
+            dot = (v @ v.T)[iu]
+            b = np.minimum((d / r_bin).astype(int), nb - 1)
+            num += np.bincount(b, dot, nb)
+            cnt += np.bincount(b, minlength=nb)
+            v2.append((v ** 2).sum(1).mean())
+    out = {key: float(np.mean([r_[key] for r_ in rows])) for key in rows[0]}
+    phis = np.concatenate(phis)
+    out["bimodality"] = _bimodality(phis)
+    out["phi_hist"] = np.histogram(phis, bins=12, range=(0, 1.2))[0].tolist()
+    corr = np.where(cnt > 0, num / np.maximum(cnt, 1), 0.0) / max(np.mean(v2), 1e-30)
+    i = int(np.argmin(corr[1:])) + 1
+    out["corr_rmin_um"] = float((i + 0.5) * r_bin * 1e6)
+    out["corr_min"] = float(corr[i])
+    out["corr"] = corr.tolist()
+    return out
+
+
+def series_arena(run_dir, every_s=10.0, stride_s=2.0):
+    """Order parameters vs time over the whole run (spot oscillations, drift)."""
+    C, A, sp, beads, meta = load(run_dir)
+    ts, R = meta["t_sample"], meta["r_arena_m"]
+    cen = np.asarray(meta["center_m"])
+    k = max(1, int(round(stride_s / ts)))
+    st = _Static(sp, beads, cen, R)
+    keys = ("t", "chi", "spin", "omega", "vpolar", "polar", "largest", "near_wall")
+    rows = []
+    for f in range(0, len(C) - k, max(1, int(round(every_s / ts)))):
+        r = _arena_frame(C[f], (C[f + k] - C[f]) / (k * ts), A[f], cen, R)
+        r["t"] = f * ts
+        r["largest"] = st.frame(C[f], A[f])[0]
+        rows.append([float(r[key]) for key in keys])
+    return {"keys": list(keys), "rows": rows}
+
+
+SETTLE_KEYS = ("chi", "spin", "vpolar", "largest", "near_wall")
+
+
+def settled(m_q3, m_q4, tol=0.1):
+    """Run counts as converged if the 3rd and 4th quarter agree within tol."""
+    return all(abs(m_q4[k] - m_q3[k]) <= tol for k in SETTLE_KEYS)
+
+
+THRESH_A = {   # walled arena; ctrl = same run with interactions off
+    "vortex": lambda m, c: m["chi"] >= 0.3 and abs(m["spin"]) >= 0.5,
+    "vortex_vs_ctrl": lambda m, c: m["chi"] - c["chi"] >= 0.15,
+    "swarm": lambda m, c: m["vpolar"] - c["vpolar"] >= 0.2,
+    "align": lambda m, c: m["local_align"] - c["local_align"] >= 0.15,
+    "bulk_cluster": lambda m, c: m["bulk_largest"] >= 0.2,
+    "phase_sep": lambda m, c: m["bimodality"] >= 0.6,
+}
+
+
+def analyse_arena(rd, cd=None):
+    """Full analysis of an arena run (+ control): summary.json and series.png.
+    Returns the summary dict."""
+    m = {**metrics_arena(rd), **wall_split(rd)}
+    q3, q4 = metrics_arena(rd, 0.5, 0.75), metrics_arena(rd, 0.75, 1.0)
+    sm = {"metrics": m, "q3": q3, "q4": q4, "settled": settled(q3, q4),
+          "series": series_arena(rd)}
+    if cd is not None:
+        mc = {**metrics_arena(cd), **wall_split(cd)}
+        sm.update(control=mc, control_dir=str(cd), series_ctrl=series_arena(cd),
+                  hits=[k for k, f in THRESH_A.items() if f(m, mc)])
+    (Path(rd) / "summary.json").write_text(json.dumps(sm, indent=1))
+    plot_series(rd)
+    return sm
+
+
+def plot_series(run_dir):
+    """series.png: order parameters vs time (control dashed)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    run_dir = Path(run_dir)
+    sm = json.loads((run_dir / "summary.json").read_text())
+    s = sm["series"]
+    sc = sm.get("series_ctrl")
+    fig, axs = plt.subplots(len(s["keys"]) - 1, 1, figsize=(7, 10), sharex=True)
+    t = np.array(s["rows"])[:, 0]
+    for ax, j in zip(axs, range(1, len(s["keys"]))):
+        ax.plot(t, np.array(s["rows"])[:, j], lw=1)
+        if sc:
+            ax.plot(np.array(sc["rows"])[:, 0], np.array(sc["rows"])[:, j], "--",
+                    lw=0.8, color="gray")
+        ax.set_ylabel(s["keys"][j])
+    axs[-1].set_xlabel("t (s)")
+    axs[0].set_title(run_dir.name)
+    fig.tight_layout()
+    fig.savefig(run_dir / "series.png", dpi=90)
+    plt.close(fig)
 
 
 THRESH = {   # what counts as "collective" against the interactions-off control
@@ -995,12 +1158,85 @@ def phase2_configs():
     return cfgs, dict(L=L, T_total=1000.0)
 
 
+# ==========================================================================
+# Phase 3: large walled arena, circle swimmers, R_T / R_arena scan
+# ==========================================================================
+LEDGER_A = COLL_DIR / "LEDGER_arena.md"
+
+
+def write_ledger_a(name, types, phi, rd, sm, wall_s):
+    COLL_DIR.mkdir(parents=True, exist_ok=True)
+    if not LEDGER_A.exists():
+        LEDGER_A.write_text(
+            "# Phase 3 ledger: walled arena, circle swimmers\n\n"
+            "Metrics over the 2nd half of the run; in brackets the same run with "
+            "interactions off. chi = vortex order (Lei et al. 2023, 1 = all motion "
+            "azimuthal); |spin| = |mean rotation sense|; vpolar = common direction of "
+            "motion (swarm); align = <cos dtheta>, pairs < 25 um; largest / bulk = "
+            "largest contact cluster / N, any / not touching the wall; wall = fraction "
+            "in wall-attached clusters; bimod = bimodality of local area fraction "
+            "(> 0.56 hints at phase separation); settled = 3rd and 4th quarter agree "
+            "within 0.1.\n\n"
+            "| name | config | phi | settled | chi (ctrl) | \\|spin\\| (ctrl) "
+            "| vpolar (ctrl) | align (ctrl) | largest | bulk | wall | bimod | speed "
+            "| hits | run | min |\n"
+            "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
+    m, c = sm["metrics"], sm["control"]
+    f = lambda k: f"{m[k]:.2f} ({c[k]:.2f})"
+    row = (f"| {name} | {describe(types)} | {phi:.2f} | {'yes' if sm['settled'] else 'NO'} "
+           f"| {f('chi')} | {abs(m['spin']):.2f} ({abs(c['spin']):.2f}) | {f('vpolar')} "
+           f"| {f('local_align')} | {m['largest']:.2f} | {m['bulk_largest']:.2f} "
+           f"| {m['wall_attached']:.2f} | {m['bimodality']:.2f} | {m['speed']:.2f} "
+           f"| {', '.join(sm['hits']) or '-'} | {Path(rd).name} | {wall_s / 60:.0f} |\n")
+    with open(LEDGER_A, "a") as fh:
+        fh.write(row)
+
+
+def run_config_arena(name, types, phi, *, r_arena, T_total, dt, seed=0, video=True):
+    """Interacting run + control in a walled arena, analyse, ledger."""
+    if LEDGER_A.exists() and f"| {name} |" in LEDGER_A.read_text():
+        print(f"skip {name} (in ledger)")
+        return None
+    t0 = time.time()
+    print(f"\n##### {name}: {describe(types)}  phi={phi}  R={r_arena * 1e6:.0f} um",
+          flush=True)
+    rd = simulate(types, name, r_arena=r_arena, T_total=T_total, dt=dt, seed=seed)
+    cd = simulate(types, name, r_arena=r_arena, T_total=T_total, dt=dt, seed=seed,
+                  interacting=False)
+    sm = analyse_arena(rd, cd)
+    if video:
+        try:
+            make_movie(rd, every_s=5.0)
+        except Exception as e:                       # never lose a run to the video
+            print("video failed:", e)
+    write_ledger_a(name, types, phi, rd, sm, time.time() - t0)
+    print(f"{name}: hits={sm['hits']}  settled={sm['settled']}", flush=True)
+    return rd
+
+
+def phase3_configs(shapes=("disk",)):
+    """R = 300 um arena, R_T / R in {0.1, 0.25, 0.5, 1, 2, inf}, phi 0.25-0.6.
+    float32 + dt 1.6 ms validated against float64 + 0.4 ms (2026-10-22)."""
+    R = 300e-6
+    cfgs = []
+    for kind in shapes:
+        for phi in (0.25, 0.45, 0.6):
+            n = counts_for_phi(phi, R, [1.0])[0]
+            for rt in (30, 75, 150, 300, 600, None):
+                tau = 0.0 if rt is None else tau_for_RT(rt * 1e-6)
+                dname = "straight" if rt is None else f"RT{rt:03d}"
+                cfgs.append((f"p3_{kind}_{dname}_phi{int(phi * 100):02d}",
+                             [PType(kind, n, "tip", tau=tau)], phi))
+    return cfgs, dict(r_arena=R, T_total=4000.0, dt=1.6e-3)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("phase")
     ap.add_argument("--worker", type=int, default=0)
     ap.add_argument("--nworkers", type=int, default=1)
     ap.add_argument("--only", default=None, help="comma-separated config names")
+    ap.add_argument("--shapes", default="disk", help="phase3: comma-separated shapes")
     a = ap.parse_args()
 
     if a.phase == "test":
@@ -1022,6 +1258,9 @@ def main():
     elif a.phase == "phase2":
         cfgs, kw = phase2_configs()
         runner = run_config_periodic
+    elif a.phase == "phase3":
+        cfgs, kw = phase3_configs(a.shapes.split(","))
+        runner = run_config_arena
     else:
         raise SystemExit(f"unknown phase {a.phase}")
     if a.only:
