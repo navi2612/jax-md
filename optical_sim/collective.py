@@ -198,7 +198,8 @@ def make_interaction(species, center, r_wall, interacting=True, k_wall=1e-4,
             if r_max is None:                  # periodic box: no wall
                 return 0.0 * jnp.sum(body.center)
             p, _ = rigid_body.union_to_points(body, shape, species)
-            over = jnp.maximum(jnp.linalg.norm(p - center, axis=-1) - r_max, 0.0)
+            dist = jnp.sqrt(jnp.sum((p - center) ** 2, -1) + 1e-30)   # finite gradient at 0
+            over = jnp.maximum(dist - r_max, 0.0)
             return 0.5 * k_wall * jnp.sum(over ** 2)
 
         if not interacting:
@@ -312,11 +313,14 @@ def counts_for_phi(phi, r_arena, fractions):
 
 
 def simulate(types, label, *, r_arena=None, L=None, T_total, t_sample=1.0, dt=4e-4,
-             seed=0, interacting=True, tag=""):
+             seed=0, interacting=True, tag="", contact="beads"):
     """Run one configuration, save it under results/collective. Returns run_dir.
 
     ``r_arena``: circular walled arena of that radius. ``L``: periodic box of
-    side L instead (no wall; a patch inside a large homogeneous spot)."""
+    side L instead (no wall; a patch inside a large homogeneous spot).
+    ``contact``: "beads" (bead-bead soft spheres; bumpy outlines act like
+    contact friction) or "spheropolygon" (frictionless true outlines, see
+    spheropolygon.py). Saved ``beads_*`` are used by the analysis either way."""
     periodic = L is not None
     box = L if periodic else 2 * r_arena + 2 * SIGMA
     center = (box / 2, box / 2)
@@ -326,8 +330,16 @@ def simulate(types, label, *, r_arena=None, L=None, T_total, t_sample=1.0, dt=4e
     shapes = [shape_of(t.kind, t.heading) for t in types]
     shape = rigid_body.concatenate_shapes(*shapes) if len(shapes) > 1 else shapes[0]
     sp = species if len(shapes) > 1 else None
-    inter = make_interaction(sp, center, None if periodic else r_arena,
-                             interacting=interacting)
+    if contact == "beads":
+        inter = make_interaction(sp, center, None if periodic else r_arena,
+                                 interacting=interacting)
+    elif contact == "spheropolygon":
+        import spheropolygon
+        inter = spheropolygon.make_interaction(
+            spheropolygon.Shapes.from_types(types), sp, center=center,
+            r_wall=None if periodic else r_arena, interacting=interacting)
+    else:
+        raise ValueError(contact)
     init = (make_periodic_init(types, species, L) if periodic
             else make_init(types, species, center, r_arena))
     steps = int(round(t_sample / dt))
@@ -341,7 +353,7 @@ def simulate(types, label, *, r_arena=None, L=None, T_total, t_sample=1.0, dt=4e
             "r_arena_m": r_arena, "L_m": L, "periodic": periodic,
             "center_m": list(center), "interacting": interacting,
             "types": [asdict(t) | {"R_T_m": t.R_T} for t in types],
-            "area_m2": AREA, "v0_m_s": V0, "tag": tag,
+            "area_m2": AREA, "v0_m_s": V0, "tag": tag, "contact": contact,
             "x64": bool(jax.config.read("jax_enable_x64"))}
     run_dir = save_run(
         arrays={"centers": centers, "angles": angles, "species": species,
@@ -784,7 +796,13 @@ def make_movie(run_dir, every_s=2.0, fps=24, trail_s=20.0):
     else:
         cen = np.asarray(meta["center_m"]) * 1e6
         R = meta["r_arena_m"] * 1e6
-    outl = [rounded_outline(t["kind"], t["heading"]) for t in types]
+    if meta.get("contact") == "spheropolygon":
+        import spheropolygon
+        outl = [None if t["kind"] == "disk" else
+                spheropolygon.rounded_outline(*spheropolygon.core_of(t["kind"], t["heading"]))
+                for t in types]
+    else:
+        outl = [rounded_outline(t["kind"], t["heading"]) for t in types]
     cmap = plt.cm.hsv
 
     fig, ax = plt.subplots(figsize=(7, 7))
