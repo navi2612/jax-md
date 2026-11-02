@@ -39,8 +39,8 @@ from trajectory import (
     run_brownian_2d, make_constant_force, lab_to_body_force,
     DEFAULT_RESISTANCE_BODY, KT_300K, K_B,
 )
-from swarm import (grid_shape, make_drive, make_force_fn,
-                          soft_sphere_interaction, soft_sphere_all_pairs)
+from swarm import make_drive, make_force_fn
+from beads import grid_shape, soft_sphere_interaction, soft_sphere_all_pairs
 
 N_WALKERS = 2000
 PASS_TOL = 0.05 # 5% relative error -> PASS
