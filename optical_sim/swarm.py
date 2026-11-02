@@ -94,14 +94,19 @@ def make_active_optical_drive(FX_pN, FY_pN, TZ_pN_nm, phi_pol=0.0, power=3):
 # --------------------------------------------------------------------------
 # the simulation
 # --------------------------------------------------------------------------
-def make_force_fn(interaction_force_fn, drive_fn):
-    """Combine steric interaction + light drive -> ``force_fn(body, light, **kw)``.
+def make_force_fn(interaction_force_fn, drive_fn, wall_fn=None):
+    """Combine steric interaction + optional wall + light drive -> ``force_fn(body, light, **kw)``.
 
     Returns ``RigidBody(force, torque)``. Any extra kwargs (notably
-    ``neighbor=``) are forwarded to the interaction; the drive never sees them.
+    ``neighbor=``) are forwarded to the interaction; the drive and the wall never
+    see them.
     """
     def force_fn(body, light=1.0, **kwargs):
         f_int = interaction_force_fn(body, **kwargs)
+        if wall_fn is not None:
+            f_wall = wall_fn(body)
+            f_int = rigid_body.RigidBody(f_int.center + f_wall.center,
+                                         f_int.orientation + f_wall.orientation)
         f_lab, tau = drive_fn(body, light)
         return rigid_body.RigidBody(f_int.center + f_lab,
                                     f_int.orientation + tau)
@@ -112,7 +117,7 @@ def make_force_fn(interaction_force_fn, drive_fn):
 def make_runner(n_particles, interaction_fn, sigma=1e-6, area_fraction=0.3, box=None,
                 steps_per_sample=100, dt=1e-4, kT=KT_300K,
                 resistance_body=DEFAULT_RESISTANCE_BODY, F_body=DEFAULT_F_BODY,
-                tau=DEFAULT_TAU, shape=None, drive_fn=None,
+                tau=DEFAULT_TAU, shape=None, drive_fn=None, wall_fn=None,
                 init=random_initial_condition,
                 grow_neighbor_buffer=True, max_extra_capacity=256,initial_extra_capacity=0,
                 progress=False):
@@ -132,9 +137,14 @@ def make_runner(n_particles, interaction_fn, sigma=1e-6, area_fraction=0.3, box=
     defaults (``single_bead_shape()`` and ``make_drive(F_body, tau)``);
     ``F_body``/``tau`` are ignored when ``drive_fn`` is given.
 
+    ``wall_fn(body) -> RigidBody(force, torque)`` is the wall, e.g.
+    ``spheropolygon.make_circular_wall``. Without one the box is periodic; with
+    one the box is periodic underneath too, but the wall keeps the bodies away
+    from its edges, so make the box larger than the arena.
+
     ``init`` is the initial condition, a callable ``init(n_particles, box, seed)
     -> (body0, key)``: ``random_initial_condition`` (default, can overlap) or
-    ``spheropolygon.make_arena_init``.
+    ``spheropolygon.make_init``.
 
     With ``grow_neighbor_buffer`` the Verlet buffer is re-allocated with more
     capacity and the run repeated whenever it overflows, up to
@@ -172,7 +182,7 @@ def make_runner(n_particles, interaction_fn, sigma=1e-6, area_fraction=0.3, box=
     displacement_fn, shift_fn = space.periodic(box)
     interaction_force_fn, nbr_fns = interaction_fn(
         shape, sigma, box, displacement_fn)
-    force_fn = make_force_fn(interaction_force_fn, drive_fn)
+    force_fn = make_force_fn(interaction_force_fn, drive_fn, wall_fn)
     init_fn, step_fn = brownian_generalized_rigid_2d(
         energy_or_force_fn=force_fn, shift_fn=shift_fn, dt=dt, kT=kT,
         resistance_body=resistance_body)
@@ -269,6 +279,7 @@ def make_runner(n_particles, interaction_fn, sigma=1e-6, area_fraction=0.3, box=
         "drive": getattr(drive_fn, "spec", "UNSPECIFIED (drive_fn has no .spec)"),
         "interaction": getattr(interaction_fn, "spec",
                                "UNSPECIFIED (interaction_fn has no .spec)"),
+        "wall": getattr(wall_fn, "spec", None),
         "shape_points_sigma": (shape_points / sigma).tolist(),
         "use_neighbor_list": bool(use_nl),
         "jax_version": jax.__version__,

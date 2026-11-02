@@ -10,11 +10,12 @@ from render_swarm import make_video
 from runs import save_run
 from swarm import make_active_optical_drive, make_drive, make_runner
 
-# --- shape and arena -------------------------------------------------------
+# --- shape and boundary ----------------------------------------------------
 KIND = "triangle"                # triangle | square | disk
 HEADING = "tip"                  # triangle only: tip | base first
+BOUNDARY = "wall"                # wall | periodic
 PHI = 0.4                        # area fraction
-R = 300e-6                       # arena radius [m]
+R = 300e-6                       # arena radius [m]; periodic uses a box of the same area
 
 # --- force -----------------------------------------------------------------
 drive = make_drive(F_body=(1.135e-12, 0.0), tau=0.0)
@@ -27,7 +28,7 @@ drive = make_drive(F_body=(1.135e-12, 0.0), tau=0.0)
 # drive = make_active_optical_drive(FX, FY, TZ, phi_pol=0.0, power=1)
 
 # --- time ------------------------------------------------------------------
-T_TOTAL = 1500.0                 # simulated time [s]
+T_TOTAL = 1000.0                 # simulated time [s]
 T_SAMPLE = 1.0                   # time between saved frames [s]
 DT = 4e-4                        # time step [s]
 SEED = 0
@@ -38,30 +39,43 @@ TARGET_FRAMES = 300
 
 
 if __name__ == "__main__":
-    box = 2 * R + 20e-6
-    center = (box / 2, box / 2)
     N = int(round(PHI * np.pi * R ** 2 / S.AREA))
     core, r = S.core_of(KIND, HEADING)
+    shapes = S.Shapes([core], [r])
     sigma = S.SIDE / 3
 
+    if BOUNDARY == "wall":
+        box = 2 * R + 20e-6
+        center = (box / 2, box / 2)
+        wall_fn = S.make_circular_wall(shapes, center, R)
+        init = S.make_init(core, r, center, R)
+    elif BOUNDARY == "periodic":
+        box = np.sqrt(np.pi) * R     # same area as the arena: same N at the same PHI
+        wall_fn = None
+        init = S.make_init(core, r)
+    else:
+        raise ValueError(BOUNDARY)
+
     runner = make_runner(n_particles=N, sigma=sigma, box=box, drive_fn=drive,
-                         interaction_fn=S.make_interaction(S.Shapes([core], [r]), None,
-                                                           center=center, r_wall=R),
-                         init=S.make_arena_init(core, r, center, R), dt=DT,
+                         interaction_fn=S.make_interaction(shapes, None),
+                         wall_fn=wall_fn, init=init, dt=DT,
                          steps_per_sample=int(round(T_SAMPLE / DT)),
-                         initial_extra_capacity=32, progress=True)
+                         initial_extra_capacity=4, progress=True)
 
     u = np.ones(int(round(T_TOTAL / T_SAMPLE)))
     centers, angles, box = runner(u, seed=SEED)
 
+    arrays = {"centers": centers, "angles": angles, "light": u, "box": box,
+              "sigma": sigma, "body_outline": S.rounded_outline(core, r)}
+    if BOUNDARY == "wall":
+        arrays["wall"] = np.array([*center, R])      # make_video draws it
+
     run_dir = save_run(
-        arrays={"centers": centers, "angles": angles, "light": u, "box": box,
-                "sigma": sigma, "body_outline": S.rounded_outline(core, r),
-                "wall": np.array([*center, R])},
+        arrays=arrays,
         meta={**runner.meta, "n_samples": len(u), "seed": SEED, "kind": KIND,
-              "heading": HEADING, "phi": PHI, "r_arena_m": R,
+              "heading": HEADING, "boundary": BOUNDARY, "phi": PHI, "R_m": R,
               "x64": os.environ["OPTSIM_X64"] != "0"},
-        label=f"{KIND}_phi{PHI:.2f}", prefix="swarm", source=__file__)
+        label=f"{KIND}_{BOUNDARY}_phi{PHI:.2f}", prefix="swarm", source=__file__)
 
     make_video(run_dir, out_path=str(run_dir / "movie.mp4"), color_by="orientation",
                target_frames=TARGET_FRAMES, fps=FPS)

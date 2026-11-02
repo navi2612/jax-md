@@ -20,8 +20,8 @@ would count twice and is weighted by 1/2.
 
 ``make_interaction`` gives ``interaction_fn(shape, sigma, box, displacement_fn)
 -> (force_fn, neighbor_fns)``, so it plugs into ``swarm.make_runner`` unchanged;
-the bead ``shape`` handed in is ignored. ``make_arena_init`` is the matching
-start inside a circular wall.
+the bead ``shape`` handed in is ignored. ``make_circular_wall`` is the optional
+arena wall and ``make_init`` the matching non-overlapping start.
 """
 import numpy as np
 import jax.numpy as jnp
@@ -134,13 +134,12 @@ def _lab_vertices(P, theta):
     return jnp.stack([c * P[..., 0] - s * P[..., 1], s * P[..., 0] + c * P[..., 1]], -1)
 
 
-def make_interaction(shapes, species, center=None, r_wall=None, interacting=True,
-                     k=K_CONTACT, k_wall=K_WALL, dr_threshold=2e-6,
-                     capacity_multiplier=2.0):
-    """Spheropolygon contacts (+ optional circular wall of radius ``r_wall``).
+def make_interaction(shapes, species, interacting=True, k=K_CONTACT,
+                     dr_threshold=2e-6, capacity_multiplier=2.0):
+    """Spheropolygon contacts between bodies.
 
     ``shapes``: ``Shapes``; ``species``: type index per body (None = all type 0).
-    ``interacting=False`` keeps only the wall (the control run)."""
+    ``interacting=False`` switches the contacts off (the control run)."""
     P = jnp.asarray(shapes.P)
     nxt = jnp.asarray(shapes.nxt)
     vmask = jnp.asarray(shapes.vmask)
@@ -155,22 +154,13 @@ def make_interaction(shapes, species, center=None, r_wall=None, interacting=True
             Eb = jnp.take_along_axis(Vb, nxt[sp][..., None], axis=-2)
             return Vb, Eb
 
-        def wall_energy(body, sp):
-            if r_wall is None:
-                return 0.0 * jnp.sum(body.center)
-            Vb, _ = geometry(body, sp)
-            x = body.center[:, None, :] + Vb - jnp.asarray(center)
-            dist = jnp.sqrt(jnp.sum(x ** 2, -1) + 1e-30)          # finite gradient at 0
-            over = jnp.maximum(dist + rad[sp][:, None] - r_wall, 0.0)
-            return 0.5 * k_wall * jnp.sum(jnp.where(vmask[sp], over ** 2, 0.0))
-
         def species_of(body):
             nb = body.center.shape[0]
             return (jnp.zeros(nb, int) if species is None else jnp.asarray(species))
 
         if not interacting:
             def ctrl(body, **kw):
-                return wall_energy(body, species_of(body))
+                return 0.0 * jnp.sum(body.center)
             return ctrl, None
 
         cutoff = 2 * shapes.reach
@@ -213,7 +203,7 @@ def make_interaction(shapes, species, center=None, r_wall=None, interacting=True
             return 0.5 * k * jnp.sum(jnp.where(m, w * over ** 2, 0.0))
 
         def total(body, neighbor, **kw):
-            return pair_energy(body, neighbor) + wall_energy(body, species_of(body))
+            return pair_energy(body, neighbor)
 
         return total, nbr_fns
 
@@ -222,16 +212,45 @@ def make_interaction(shapes, species, center=None, r_wall=None, interacting=True
         return quantity.force(energy_fn), nbr_fns
 
     interaction_fn.build = build
-    interaction_fn.spec = {"type": "spheropolygon" + ("+circular_wall" if r_wall else ""),
+    interaction_fn.spec = {"type": "spheropolygon",
                            "interacting": bool(interacting), "k_N_per_m": k,
-                           "k_wall_N_per_m_per_vertex": k_wall, "r_wall_m": r_wall,
                            "radii_m": shapes.r.tolist(), "n_vertices": shapes.n.tolist(),
                            "reference": "Alonso-Marroquin, EPL 83, 14001 (2008)"}
     return interaction_fn
 
 
-def make_arena_init(core, r, center, r_wall, margin=0.08, stages=30, iters=300):
-    """Start inside a circular wall for ``swarm.make_runner``, one shape.
+def make_circular_wall(shapes, center, r_wall, species=None, k_wall=K_WALL):
+    """Soft circular wall of radius ``r_wall``, acting on every vertex of a body.
+
+    ``wall_fn(body) -> RigidBody(force, torque)`` for ``swarm.make_runner``."""
+    P = jnp.asarray(shapes.P)
+    vmask = jnp.asarray(shapes.vmask)
+    rad = jnp.asarray(shapes.r)
+    c0 = jnp.asarray(center)
+
+    def wall_energy(body):
+        nb = body.center.shape[0]
+        sp = jnp.zeros(nb, int) if species is None else jnp.asarray(species)
+        x = body.center[:, None, :] + _lab_vertices(P[sp], body.orientation) - c0
+        dist = jnp.sqrt(jnp.sum(x ** 2, -1) + 1e-30)              # finite gradient at 0
+        over = jnp.maximum(dist + rad[sp][:, None] - r_wall, 0.0)
+        return 0.5 * k_wall * jnp.sum(jnp.where(vmask[sp], over ** 2, 0.0))
+
+    wall_force = quantity.force(wall_energy)
+
+    def wall_fn(body):
+        return wall_force(body)
+
+    wall_fn.spec = {"type": "circular", "center_m": [float(x) for x in center],
+                    "r_wall_m": float(r_wall), "k_wall_N_per_m_per_vertex": float(k_wall)}
+    return wall_fn
+
+
+def make_init(core, r, center=None, r_wall=None, margin=0.08, stages=30, iters=300):
+    """Non-overlapping start for ``swarm.make_runner``, one shape.
+
+    With ``center`` and ``r_wall``: inside that circular wall. Without them:
+    across the whole periodic box.
 
     Random centres and headings, then every body grows from 50% to full size
     while overlapping pairs are pushed apart along their separating axis and
@@ -239,10 +258,12 @@ def make_arena_init(core, r, center, r_wall, margin=0.08, stages=30, iters=300):
     the convex cores, so it also sees a body buried inside another, which the
     contact energy cannot. ``margin``: spare gap as a fraction of r_i + r_j.
     ``core``, ``r``: from ``core_of``."""
+    periodic = r_wall is None
     core = np.asarray(core, float)
-    center = np.asarray(center, float)
     r_core = np.linalg.norm(core, axis=1).max()
-    r_lim = r_wall - (r_core + r)
+    if not periodic:
+        center = np.asarray(center, float)
+        r_lim = r_wall - (r_core + r)
     normals = np.zeros((0, 2))
     if len(core) > 1:
         e = np.roll(core, -1, axis=0) - core
@@ -254,14 +275,17 @@ def make_arena_init(core, r, center, r_wall, margin=0.08, stages=30, iters=300):
         co, si = np.cos(th)[:, None], np.sin(th)[:, None]
         return np.stack([co * p[:, 0] - si * p[:, 1], si * p[:, 0] + co * p[:, 1]], -1)
 
-    def separation(pos, th, g, i, j):
+    def separation(pos, th, g, i, j, box):
         """Largest gap between the cores of pairs (i, j) over the candidate
         axes, and that axis (unit, i -> j). A lower bound on their distance."""
-        d = pos[j] - pos[i]
+        pj = pos[j]
+        if periodic:
+            pj = pj - box * np.round((pj - pos[i]) / box)            # nearest image of j
+        d = pj - pos[i]
         axes = (d / np.maximum(np.linalg.norm(d, axis=1, keepdims=True), 1e-12))[:, None]
         axes = np.concatenate([axes, rotated(normals, th[i]), -rotated(normals, th[j])], 1)
         Vi = pos[i][:, None] + g * rotated(core, th[i])
-        Vj = pos[j][:, None] + g * rotated(core, th[j])
+        Vj = pj[:, None] + g * rotated(core, th[j])
         ax_T = axes.transpose(0, 2, 1)
         gap = (Vj @ ax_T).min(1) - (Vi @ ax_T).max(1)                # (P, n_axes)
         best = gap.argmax(1)
@@ -270,20 +294,24 @@ def make_arena_init(core, r, center, r_wall, margin=0.08, stages=30, iters=300):
 
     def init(n_particles, box, seed):
         rng = np.random.default_rng(seed)
-        rr = r_lim * np.sqrt(rng.uniform(size=n_particles))
-        a = rng.uniform(0, 2 * np.pi, n_particles)
-        pos = center + rr[:, None] * np.c_[np.cos(a), np.sin(a)]
+        if periodic:
+            pos = rng.uniform(0, box, (n_particles, 2))
+        else:
+            rr = r_lim * np.sqrt(rng.uniform(size=n_particles))
+            a = rng.uniform(0, 2 * np.pi, n_particles)
+            pos = center + rr[:, None] * np.c_[np.cos(a), np.sin(a)]
         th = rng.uniform(-np.pi, np.pi, n_particles)
 
         def relax(g, n_iter):
             nonlocal pos
             need = 2 * r * g * (1 + margin)
             for _ in range(n_iter):
-                pairs = cKDTree(pos).query_pairs(2 * g * r_core + need, output_type="ndarray")
+                tree = cKDTree(pos, boxsize=box if periodic else None)
+                pairs = tree.query_pairs(2 * g * r_core + need, output_type="ndarray")
                 if len(pairs) == 0:
                     return True
                 i, j = pairs.T
-                gap, ax = separation(pos, th, g, i, j)
+                gap, ax = separation(pos, th, g, i, j, box)
                 keep = gap < need
                 if not keep.any():
                     return True
@@ -294,9 +322,13 @@ def make_arena_init(core, r, center, r_wall, margin=0.08, stages=30, iters=300):
                 np.add.at(disp, i, -push); np.add.at(disp, j, push)
                 np.add.at(cnt, i, 1); np.add.at(cnt, j, 1)
                 pos = pos + disp / np.maximum(cnt, 1)[:, None] * 1.5
-                rel = pos - center
-                dist = np.maximum(np.hypot(*rel.T), 1e-12)
-                pos = center + rel * np.minimum(1.0, r_lim / dist)[:, None]
+                if periodic:
+                    pos = np.mod(pos, box)
+                    pos[pos >= box] = 0.0                            # mod can round up to box
+                else:
+                    rel = pos - center
+                    dist = np.maximum(np.hypot(*rel.T), 1e-12)
+                    pos = center + rel * np.minimum(1.0, r_lim / dist)[:, None]
             return False
 
         for g in np.linspace(0.5, 1.0, stages):
@@ -306,5 +338,5 @@ def make_arena_init(core, r, center, r_wall, margin=0.08, stages=30, iters=300):
         return (rigid_body.RigidBody(jnp.asarray(pos), jnp.asarray(th)),
                 random.PRNGKey(seed))
 
-    init.__name__ = "spheropolygon_arena_init"
+    init.__name__ = "spheropolygon_periodic_init" if periodic else "spheropolygon_arena_init"
     return init
