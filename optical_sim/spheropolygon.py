@@ -18,27 +18,50 @@ corner-face one 1 -- the stiffness varies by a small factor with the contact
 type, the direction of the force does not. A disk-disk pair (both one-vertex)
 would count twice and is weighted by 1/2.
 
-Same interface as ``collective.make_interaction``: ``interaction_fn(shape,
-sigma, box, displacement_fn) -> (force_fn, neighbor_fns)``, so it plugs into
-``swarm.make_runner`` unchanged; the bead ``shape`` handed in is ignored.
+``make_interaction`` gives ``interaction_fn(shape, sigma, box, displacement_fn)
+-> (force_fn, neighbor_fns)``, so it plugs into ``swarm.make_runner`` unchanged;
+the bead ``shape`` handed in is ignored. ``make_arena_init`` is the matching
+start inside a circular wall.
 """
 import numpy as np
 import jax.numpy as jnp
+from jax import random
 from jax_md import dataclasses, partition, quantity, rigid_body, space
+from scipy.spatial import cKDTree
 
+SIDE = 10e-6            # square side [m]; sets the common area of all shapes
+AREA = SIDE ** 2
 R_ROUND = 1.0e-6        # corner rounding of polygons [m]
 K_CONTACT = 2.5e-5      # stiffness per vertex-edge term [N/m] (= one bead-bead contact)
 K_WALL = 1.0e-4         # wall stiffness per vertex [N/m] (as the bead wall)
 
 
+def outline(kind, heading="tip"):
+    """True outline in the body frame [m]: polygon vertices, or None for a disk."""
+    if kind == "disk":
+        return None
+    if kind == "square":
+        h = SIDE / 2
+        return np.array([[h, h], [-h, h], [-h, -h], [h, -h]])
+    if kind == "triangle":
+        a = np.sqrt(4 * AREA / np.sqrt(3))            # side of the equal-area triangle
+        rc = a / np.sqrt(3)                            # circumradius
+        ang = np.deg2rad([0, 120, 240]) + (np.pi if heading == "base" else 0.0)
+        return rc * np.c_[np.cos(ang), np.sin(ang)]
+    raise ValueError(kind)
+
+
+def disk_radius():
+    return np.sqrt(AREA / np.pi)
+
+
 def core_of(kind, heading="tip", r=R_ROUND):
     """(core vertices [m] in the body frame, sweep radius [m]) of one shape.
-    The rounded body has the true outline of ``collective.outline`` with
-    corners rounded by ``r``; a disk is its centre point with r = disk radius."""
-    import collective as c
-    V = c.outline(kind, heading)
+    The rounded body has the true outline of ``outline`` with corners rounded
+    by ``r``; a disk is its centre point with r = disk radius."""
+    V = outline(kind, heading)
     if V is None:
-        return np.zeros((1, 2)), c.disk_radius()
+        return np.zeros((1, 2)), disk_radius()
     nv = len(V)
     apothem = np.linalg.norm(V[0]) * np.cos(np.pi / nv)
     return V * (apothem - r) / apothem, r
@@ -205,3 +228,83 @@ def make_interaction(shapes, species, center=None, r_wall=None, interacting=True
                            "radii_m": shapes.r.tolist(), "n_vertices": shapes.n.tolist(),
                            "reference": "Alonso-Marroquin, EPL 83, 14001 (2008)"}
     return interaction_fn
+
+
+def make_arena_init(core, r, center, r_wall, margin=0.08, stages=30, iters=300):
+    """Start inside a circular wall for ``swarm.make_runner``, one shape.
+
+    Random centres and headings, then every body grows from 50% to full size
+    while overlapping pairs are pushed apart along their separating axis and
+    escapees pulled back in; headings stay as drawn. The overlap test works on
+    the convex cores, so it also sees a body buried inside another, which the
+    contact energy cannot. ``margin``: spare gap as a fraction of r_i + r_j.
+    ``core``, ``r``: from ``core_of``."""
+    core = np.asarray(core, float)
+    center = np.asarray(center, float)
+    r_core = np.linalg.norm(core, axis=1).max()
+    r_lim = r_wall - (r_core + r)
+    normals = np.zeros((0, 2))
+    if len(core) > 1:
+        e = np.roll(core, -1, axis=0) - core
+        normals = np.c_[e[:, 1], -e[:, 0]] / np.linalg.norm(e, axis=1, keepdims=True)
+        normals *= np.sign(np.sum(normals * core, axis=1, keepdims=True))   # outward
+
+    def rotated(p, th):
+        """Body-frame points p (K, 2) at headings th (P,) -> (P, K, 2)."""
+        co, si = np.cos(th)[:, None], np.sin(th)[:, None]
+        return np.stack([co * p[:, 0] - si * p[:, 1], si * p[:, 0] + co * p[:, 1]], -1)
+
+    def separation(pos, th, g, i, j):
+        """Largest gap between the cores of pairs (i, j) over the candidate
+        axes, and that axis (unit, i -> j). A lower bound on their distance."""
+        d = pos[j] - pos[i]
+        axes = (d / np.maximum(np.linalg.norm(d, axis=1, keepdims=True), 1e-12))[:, None]
+        axes = np.concatenate([axes, rotated(normals, th[i]), -rotated(normals, th[j])], 1)
+        Vi = pos[i][:, None] + g * rotated(core, th[i])
+        Vj = pos[j][:, None] + g * rotated(core, th[j])
+        ax_T = axes.transpose(0, 2, 1)
+        gap = (Vj @ ax_T).min(1) - (Vi @ ax_T).max(1)                # (P, n_axes)
+        best = gap.argmax(1)
+        k = np.arange(len(d))
+        return gap[k, best], axes[k, best]
+
+    def init(n_particles, box, seed):
+        rng = np.random.default_rng(seed)
+        rr = r_lim * np.sqrt(rng.uniform(size=n_particles))
+        a = rng.uniform(0, 2 * np.pi, n_particles)
+        pos = center + rr[:, None] * np.c_[np.cos(a), np.sin(a)]
+        th = rng.uniform(-np.pi, np.pi, n_particles)
+
+        def relax(g, n_iter):
+            nonlocal pos
+            need = 2 * r * g * (1 + margin)
+            for _ in range(n_iter):
+                pairs = cKDTree(pos).query_pairs(2 * g * r_core + need, output_type="ndarray")
+                if len(pairs) == 0:
+                    return True
+                i, j = pairs.T
+                gap, ax = separation(pos, th, g, i, j)
+                keep = gap < need
+                if not keep.any():
+                    return True
+                i, j, gap, ax = i[keep], j[keep], gap[keep], ax[keep]
+                push = 0.5 * (1.05 * need - gap)[:, None] * ax
+                disp = np.zeros_like(pos)
+                cnt = np.zeros(n_particles)
+                np.add.at(disp, i, -push); np.add.at(disp, j, push)
+                np.add.at(cnt, i, 1); np.add.at(cnt, j, 1)
+                pos = pos + disp / np.maximum(cnt, 1)[:, None] * 1.5
+                rel = pos - center
+                dist = np.maximum(np.hypot(*rel.T), 1e-12)
+                pos = center + rel * np.minimum(1.0, r_lim / dist)[:, None]
+            return False
+
+        for g in np.linspace(0.5, 1.0, stages):
+            relax(g, iters)
+        if not relax(1.0, 20 * iters):
+            raise RuntimeError(f"could not remove overlaps (n={n_particles}); lower phi")
+        return (rigid_body.RigidBody(jnp.asarray(pos), jnp.asarray(th)),
+                random.PRNGKey(seed))
+
+    init.__name__ = "spheropolygon_arena_init"
+    return init

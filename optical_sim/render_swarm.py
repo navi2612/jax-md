@@ -14,6 +14,9 @@ Three body styles, chosen automatically by ``body="auto"``:
               cleaner than beads for large N. Used when a side is known but the
               bead layout is not.
 ``"disk"``    one disk of diameter ``sigma`` per body -- the single-bead case.
+``"polygon"`` the true outline ``body_outline`` (V,2) [m], e.g. from
+              ``spheropolygon.rounded_outline``. Used when the run carries
+              ``body_outline``.
 
     python render_swarm.py                      # renders swarm_run.npz
     from render_swarm import make_video
@@ -46,13 +49,20 @@ def _pick_writer(out_path):
     return str(p), "pillow"
 
 
-def _body_geometry(run, body, body_points, body_side, sigma):
+def _body_geometry(run, body, body_points, body_side, sigma, body_outline=None):
     """Resolve the drawing style -> (mode, points (B,2) [um], side [um]).
 
     Looks for ``body_points`` / ``side`` / ``body_side_m`` in the run (top level
     or in ``meta``) unless given explicitly.
     """
     meta = run.get("meta", {}) if isinstance(run.get("meta", {}), dict) else {}
+
+    if body_outline is None:
+        body_outline = run.get("body_outline")
+    if body == "polygon" and body_outline is None:
+        raise ValueError("body='polygon' needs `body_outline` (the run has none)")
+    if body in (None, "auto", "polygon") and body_outline is not None:
+        return "polygon", np.asarray(body_outline, dtype=float).reshape(-1, 2) * 1e6, None
 
     if body_points is None:
         body_points = run.get("body_points")
@@ -86,12 +96,15 @@ def _body_geometry(run, body, body_points, body_side, sigma):
 def make_video(run, out_path="swarm.mp4", target_frames=240,
                trail_frames=80, fps=24, draw_ghosts=True, title=None,
                body="auto", body_points=None, body_side=None,
-               color_by="index"):
+               color_by="index", body_outline=None, wall=None):
     """Render a time-lapse video of a swarm run.
 
     ``run`` may be the dict returned by ``run``/``run_one``, a run folder, or a
     ``trajectory.npz`` path -- so any old run can be re-rendered without
     re-simulating. See the module docstring for the ``body`` styles.
+
+    ``wall`` is ``(center_x, center_y, radius)`` [m], or ``wall`` in the run: draws
+    the circular wall and turns the periodic ghosts off.
 
     ``color_by``:
       ``"index"``        turbo over particle index (fixed, carries no information)
@@ -115,8 +128,14 @@ def make_video(run, out_path="swarm.mp4", target_frames=240,
     sigma = float(run["sigma"]) * 1e6
     T_all, N, _ = centers.shape
 
-    mode, pts, side = _body_geometry(run, body, body_points, body_side, sigma)
-    head_len = 0.5 * (side if mode == "square" else sigma)
+    mode, pts, side = _body_geometry(run, body, body_points, body_side, sigma, body_outline)
+    filled = mode in ("square", "polygon")
+    head_len = (np.linalg.norm(pts, axis=1).min() if mode == "polygon"
+                else 0.5 * (side if mode == "square" else sigma))
+    if wall is None:
+        wall = run.get("wall")
+    if wall is not None:
+        draw_ghosts = False
 
     skip = max(1, int(T_all // target_frames))
     C = centers[::skip]
@@ -139,7 +158,7 @@ def make_video(run, out_path="swarm.mp4", target_frames=240,
               if draw_ghosts else np.zeros((1, 2)))
     G = len(ghosts)
     B = 4 if mode == "square" else len(pts)
-    rep = G if mode == "square" else B * G   # face colours per body
+    rep = G if filled else B * G             # face colours per body
     square = 0.5 * (side or sigma) * np.array([[-1, -1], [1, -1], [1, 1], [-1, 1]])
 
     def _rot(f):
@@ -157,17 +176,20 @@ def make_video(run, out_path="swarm.mp4", target_frames=240,
         cg = (C[f][:, None, :] + ghosts[None, :, :]).reshape(-1, 2)
         hg = (head[:, None, :] + ghosts[None, :, :]).reshape(-1, 2)
         ticks = np.stack([cg, hg], axis=1)                    # (N*G,2,2)
-        if mode == "square":
-            verts = world.transpose(0, 2, 1, 3).reshape(-1, 4, 2)   # (N*G,4,2)
+        if filled:
+            verts = world.transpose(0, 2, 1, 3).reshape(-1, B, 2)   # (N*G,B,2)
             return verts, ticks
         return world.reshape(-1, 2), ticks                    # (N*B*G,2) offsets
 
     fig, ax = plt.subplots(figsize=(7, 7))
     ax.set_aspect("equal"); ax.set_xlim(0, box); ax.set_ylim(0, box)
     ax.set_xlabel("x  (µm)"); ax.set_ylabel("y  (µm)")
+    if wall is not None:
+        cx, cy, r_wall = np.asarray(wall, dtype=float) * 1e6
+        ax.add_patch(plt.Circle((cx, cy), r_wall, fill=False, color="k", lw=1.5, zorder=4))
 
     geom0, ticks0 = frame_geometry(0)
-    if mode == "square":
+    if filled:
         bodies = PolyCollection(geom0, facecolors=np.repeat(face, G, axis=0),
                                 edgecolors="k", linewidths=0.7, alpha=0.6,
                                 zorder=5)
@@ -191,7 +213,7 @@ def make_video(run, out_path="swarm.mp4", target_frames=240,
 
     def update(f):
         geom, ticks = frame_geometry(f)
-        if mode == "square":
+        if filled:
             bodies.set_verts(geom)
         else:
             bodies.set_offsets(geom)
