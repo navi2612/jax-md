@@ -9,6 +9,7 @@ import spheropolygon as S
 from render_swarm import make_video
 from runs import save_run
 from swarm import make_active_optical_drive, make_drive, make_runner
+from trajectory import DEFAULT_RESISTANCE_BODY
 
 # --- shape and boundary ----------------------------------------------------
 KIND = "triangle"                # triangle | square | disk
@@ -20,6 +21,12 @@ R = 300e-6                       # arena radius [m]; periodic uses a box of the 
 # --- force -----------------------------------------------------------------
 drive = make_drive(F_body=(1.135e-12, 0.0), tau=0.0)
 
+F = 1.135e-12                    # propulsion force [N]
+R_T = 80e-6                      # turning radius [m]; sign of tau sets the direction
+G = DEFAULT_RESISTANCE_BODY
+tau = F * float(G[2, 2]) / (float(G[0, 0]) * R_T)
+drive = make_drive(F_body=(F, 0.0), tau=tau)
+
 # fitted forces from active_optical.py; power = 3 scales 10 uW fits to 30 uW,
 # use 1 if the coefficients are already at the power you want
 # FX = [1.24171, 0.443034, 0.0]        # desing1_res60_linear_30uW
@@ -28,7 +35,7 @@ drive = make_drive(F_body=(1.135e-12, 0.0), tau=0.0)
 # drive = make_active_optical_drive(FX, FY, TZ, phi_pol=0.0, power=1)
 
 # --- time ------------------------------------------------------------------
-T_TOTAL = 1000.0                 # simulated time [s]
+T_TOTAL = 500.0                 # simulated time [s]
 T_SAMPLE = 1.0                   # time between saved frames [s]
 DT = 4e-4                        # time step [s]
 SEED = 0

@@ -227,7 +227,8 @@ def main(save_dir=None):
     # ---- 5. swarm interaction forces (rigid bodies) ----
     sw = check_swarm_forces()
     scale = sw["interaction_force_scale"]
-    EXACT_TOL = 1e-9                     # these are exact identities, not estimates
+    # these are exact identities, not estimates: only rounding may remain
+    EXACT_TOL = 100 * float(jnp.finfo(jnp.result_type(float)).eps)
     for name, val in (("neighbor-list vs all-pairs force", sw["nl_vs_pair_force"]),
                       ("net internal force (Newton 3)", sw["net_interaction_force"])):
         rel = val / scale if scale > 0 else float("inf")
